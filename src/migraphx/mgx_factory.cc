@@ -6,6 +6,8 @@
 #include <windows.h>
 #endif
 
+#include <climits>
+
 #include "common/parse_string.h"
 #include "common/plugin_ep_utils.h"
 
@@ -86,15 +88,22 @@ ProviderFactory::ProviderFactory(const ApiPtrs& api_ptrs, const char* ep_name, c
         API_CALL_S(ProviderFactory, this_, CreateExternalResourceImporterForDevice,
             Ort::ConstEpDevice{ep_device}, *out_importer);
     };
-    // OrtEpFactory::GetNumCustomOpDomains = [](OrtEpFactory* this_, size_t* num_domains) noexcept {
-    //     API_CALL_S(ProviderFactory, this_, GetNumCustomOpDomains, num_domains);
-    // };
-    // OrtEpFactory::GetCustomOpDomains = [](OrtEpFactory* this_, OrtCustomOpDomain** domains,
-    //         const size_t num_domains) noexcept {
-    //     API_CALL_S(ProviderFactory, this_, GetCustomOpDomains, domains, num_domains);
-    // };
+    OrtEpFactory::GetNumCustomOpDomains = [](OrtEpFactory* this_, size_t* num_domains) noexcept {
+        API_CALL_S(ProviderFactory, this_, GetNumCustomOpDomains, num_domains);
+    };
+    OrtEpFactory::GetCustomOpDomains = [](OrtEpFactory* this_, OrtCustomOpDomain** domains,
+            const size_t num_domains) noexcept {
+        API_CALL_S(ProviderFactory, this_, GetCustomOpDomains, domains, num_domains);
+    };
 
     data_transfer_ = std::make_unique<hip::DataTransfer>(*this);
+}
+
+ProviderFactory::~ProviderFactory() {
+    if (custom_op_domain_ != nullptr) {
+        ort_api.ReleaseCustomOpDomain(custom_op_domain_);
+        custom_op_domain_ = nullptr;
+    }
 }
 
 const char* ProviderFactory::GetName() const {
@@ -302,24 +311,110 @@ try {
 //     return Ort::Status{e.what(), ORT_EP_FAIL};
 // }
 
-// Ort::Status ProviderFactory::GetNumCustomOpDomains(size_t& num_domains) const
-// try {
-//     num_domains = 0;
-//     return nullptr;
-// } catch (const Ort::Exception& e) {
-//     return Ort::Status{e};
-// } catch (const std::exception& e) {
-//     return Ort::Status{e.what(), ORT_EP_FAIL};
-// }
+// ---------------------------------------------------------------------------
+// Schema-only custom op for GptOssMoE.
+//
+// The MIGraphX EP claims "GptOssMoE" in GetCapability (it is a registered
+// migraphx onnx op-parser), so this OrtCustomOp exists ONLY so ORT's graph
+// validation accepts the node — its kernel is never created or invoked. We
+// therefore declare just the type signature (6 inputs / 1 output) and stub the
+// kernel callbacks.
+//
+// 3-way name contract: this name, parse_gptoss_moe.cpp, and the model rewriter
+// must all use exactly "GptOssMoE".
+// ---------------------------------------------------------------------------
+namespace {
 
-// Ort::Status ProviderFactory::GetCustomOpDomains(OrtCustomOpDomain** domains, size_t num_domains) const
-// try {
-//     return STATUS_OK;
-// } catch (const Ort::Exception& e) {
-//     return Ort::Status{e};
-// } catch (const std::exception& e) {
-//     return Ort::Status{e.what(), ORT_EP_FAIL};
-// }
+constexpr size_t kGptOssMoeNumInputs  = 6;
+constexpr size_t kGptOssMoeNumOutputs = 1;
+
+// in0 hidden f16, in1 router_logits f32, in2 fc1_w u32, in3 fc1_s f32,
+// in4 fc2_w u32, in5 fc2_s f32
+constexpr ONNXTensorElementDataType kGptOssMoeInputTypes[kGptOssMoeNumInputs] = {
+    ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16,
+    ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+    ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32,
+    ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+    ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32,
+    ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+};
+
+struct GptOssMoeCustomOp : OrtCustomOp
+{
+    GptOssMoeCustomOp()
+    {
+        version                       = ORT_API_VERSION;
+        GetName                       = [](const OrtCustomOp*) { return "GptOssMoE"; };
+        // nullptr EP type => no CPU kernel; the node is claimed by the MIGraphX EP.
+        GetExecutionProviderType      = [](const OrtCustomOp*) -> const char* { return nullptr; };
+        GetInputTypeCount             = [](const OrtCustomOp*) { return kGptOssMoeNumInputs; };
+        GetInputType                  = [](const OrtCustomOp*, size_t i) { return kGptOssMoeInputTypes[i]; };
+        GetOutputTypeCount            = [](const OrtCustomOp*) { return kGptOssMoeNumOutputs; };
+        // Output is FP16 (io_dtype): matches the proven concat-dense path, where the
+        // MoE output is cast to fp16 before SkipLayerNorm (both SkipLN inputs fp16, as
+        // ORT's schema requires). The op computes fp32 internally; parser converts out.
+        GetOutputType                 = [](const OrtCustomOp*, size_t) {
+            return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16;
+        };
+        GetInputCharacteristic        = [](const OrtCustomOp*, size_t) {
+            return INPUT_OUTPUT_REQUIRED;
+        };
+        GetOutputCharacteristic       = [](const OrtCustomOp*, size_t) {
+            return INPUT_OUTPUT_REQUIRED;
+        };
+        GetInputMemoryType            = [](const OrtCustomOp*, size_t) { return OrtMemTypeDefault; };
+        // Kernel callbacks: never invoked (EP claims the node). Stub safely.
+        CreateKernel                  = [](const OrtCustomOp*, const OrtApi*, const OrtKernelInfo*) -> void* {
+            return nullptr;
+        };
+        KernelCompute                 = [](void*, OrtKernelContext*) {};
+        KernelDestroy                 = [](void*) {};
+        GetVariadicInputMinArity      = [](const OrtCustomOp*) { return 0; };
+        GetVariadicInputHomogeneity   = [](const OrtCustomOp*) { return 0; };
+        GetVariadicOutputMinArity     = [](const OrtCustomOp*) { return 0; };
+        GetVariadicOutputHomogeneity  = [](const OrtCustomOp*) { return 0; };
+        CreateKernelV2                = nullptr;
+        KernelComputeV2               = nullptr;
+        InferOutputShapeFn            = nullptr;
+        GetStartVersion               = [](const OrtCustomOp*) { return 1; };
+        GetEndVersion                 = [](const OrtCustomOp*) { return INT_MAX; };
+        GetMayInplace                 = nullptr;
+        ReleaseMayInplace             = nullptr;
+        GetAliasMap                   = nullptr;
+        ReleaseAliasMap               = nullptr;
+    }
+};
+
+GptOssMoeCustomOp g_gptoss_moe_custom_op{};
+
+} // namespace
+
+Ort::Status ProviderFactory::GetNumCustomOpDomains(size_t* num_domains) const
+try {
+    *num_domains = 1;
+    return Ort::Status{nullptr};
+} catch (const Ort::Exception& e) {
+    return Ort::Status{e};
+} catch (const std::exception& e) {
+    return Ort::Status{e.what(), ORT_EP_FAIL};
+}
+
+Ort::Status ProviderFactory::GetCustomOpDomains(OrtCustomOpDomain** domains, size_t num_domains) const
+try {
+    if (num_domains < 1) {
+        return Ort::Status{"GetCustomOpDomains: insufficient domain capacity", ORT_INVALID_ARGUMENT};
+    }
+    if (custom_op_domain_ == nullptr) {
+        RETURN_IF_ERROR(ort_api.CreateCustomOpDomain("com.migraphx", &custom_op_domain_));
+        RETURN_IF_ERROR(ort_api.CustomOpDomain_Add(custom_op_domain_, &g_gptoss_moe_custom_op));
+    }
+    domains[0] = custom_op_domain_;
+    return Ort::Status{nullptr};
+} catch (const Ort::Exception& e) {
+    return Ort::Status{e};
+} catch (const std::exception& e) {
+    return Ort::Status{e.what(), ORT_EP_FAIL};
+}
 
 Ort::Status ProviderFactory::GetKernelRegistry(std::string_view ep_name, const OrtKernelRegistry*& kernel_registry) const {
     kernel_registry = nullptr;
