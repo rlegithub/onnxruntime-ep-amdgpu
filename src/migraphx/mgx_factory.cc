@@ -325,17 +325,19 @@ try {
 // ---------------------------------------------------------------------------
 namespace {
 
-constexpr size_t kGptOssMoeNumInputs  = 6;
+constexpr size_t kGptOssMoeNumInputs  = 8;
 constexpr size_t kGptOssMoeNumOutputs = 1;
 
 // in0 hidden f16, in1 router_logits f32, in2 fc1_w u32, in3 fc1_s f32,
-// in4 fc2_w u32, in5 fc2_s f32
+// in4 fc2_w u32, in5 fc2_s f32, in6 fc1_b f32, in7 fc2_b f32
 constexpr ONNXTensorElementDataType kGptOssMoeInputTypes[kGptOssMoeNumInputs] = {
     ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16,
     ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
     ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32,
     ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
     ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32,
+    ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+    ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
     ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
 };
 

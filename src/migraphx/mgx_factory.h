@@ -15,6 +15,7 @@ namespace mgx_ep {
 
 struct ProviderFactory : OrtEpFactory, ApiPtrs {
     ProviderFactory(const ApiPtrs& api_ptrs, const char* ep_name, const Ort::Logger& default_logger);
+    ~ProviderFactory();
 
     Ort::Status GetKernelRegistry(std::string_view ep_name, const OrtKernelRegistry*& kernel_registry) const;
 
@@ -55,8 +56,13 @@ private:
     Ort::Status CreateExternalResourceImporterForDevice(const Ort::ConstEpDevice& ep_device,
         OrtExternalResourceImporterImpl*& out_importer) const;
 
-    //    Ort::Status GetNumCustomOpDomains(size_t* num_domains) const;
-    //    Ort::Status GetCustomOpDomains(OrtCustomOpDomain** domains, size_t num_domains) const;
+    Ort::Status GetNumCustomOpDomains(size_t* num_domains) const;
+    Ort::Status GetCustomOpDomains(OrtCustomOpDomain** domains, size_t num_domains) const;
+
+    // Lazily-created custom-op domain (com.migraphx) holding the GptOssMoE schema.
+    // Schema-only: the MIGraphX EP claims the node in GetCapability, so the op's
+    // kernel is never invoked. The factory owns the domain for its lifetime.
+    mutable OrtCustomOpDomain* custom_op_domain_{};
 
     const Ort::Logger default_logger_;
 
