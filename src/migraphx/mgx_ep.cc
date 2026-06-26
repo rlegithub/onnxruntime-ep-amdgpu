@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <set>
 #include <string>
 #include <string_view>
@@ -32,6 +33,41 @@ const char* ExecutionProvider::GetName() const noexcept {
 }
 
 namespace {
+
+// E3 EP per-token gap profiler. Env-gated (MIGRAPHX_EP_PROFILE=1). Coarse host
+// timers around the per-token Compute regions to split the ~12ms EP/OGA gap into
+// shapecheck / rebind / run-enqueue / sync(GPU-wait). Default OFF = zero overhead.
+struct ep_token_profiler {
+    bool enabled{false};
+    std::size_t calls{0};        // total Compute calls seen (incl. prefill/warmup)
+    std::size_t win_tokens{0};   // tokens accumulated in current window
+    double t_shapecheck{0}, t_rebind{0}, t_enqueue{0}, t_sync{0};  // windowed sums
+    std::size_t report_every{0};
+    std::size_t warmup_skip{0};  // skip the first N calls (prefill + cold tokens)
+    ep_token_profiler() {
+        enabled = !platform::GetEnvironmentVar("MIGRAPHX_EP_PROFILE").empty();
+        report_every = ParseEnvironmentVariableWithDefault<std::size_t>("MIGRAPHX_EP_PROFILE_EVERY", 20);
+        warmup_skip = ParseEnvironmentVariableWithDefault<std::size_t>("MIGRAPHX_EP_PROFILE_SKIP", 5);
+    }
+    void reset_window() { win_tokens = 0; t_shapecheck = t_rebind = t_enqueue = t_sync = 0; }
+    void report() {
+        if (win_tokens == 0) return;
+        const double n = static_cast<double>(win_tokens);
+        fprintf(stderr,
+            "[ep-profile] window=%zu tok (after %zu warmup): per-token(ms) shapecheck=%.3f rebind=%.3f enqueue=%.3f sync(GPUwait)=%.3f  sum=%.3f\n",
+            win_tokens, warmup_skip, t_shapecheck/n, t_rebind/n, t_enqueue/n, t_sync/n,
+            (t_shapecheck+t_rebind+t_enqueue+t_sync)/n);
+    }
+    ~ep_token_profiler() { if (enabled) report(); }
+};
+inline ep_token_profiler& ep_profiler() {
+    static ep_token_profiler p;
+    return p;
+}
+using ep_clock = std::chrono::steady_clock;
+inline double ms_since(const ep_clock::time_point& t0) {
+    return std::chrono::duration<double, std::milli>(ep_clock::now() - t0).count();
+}
 
 ONNXTensorElementDataType GetElementType(const Ort::ConstTypeInfo& type_info) {
     switch (type_info.GetONNXType()) {
@@ -968,6 +1004,10 @@ Ort::Status NodeComputeInfo::Compute(ComputeState& compute_state, const Ort::Ker
     migraphx::program_parameter_shapes param_shapes;
     hash::Value input_shapes_hash{};
 
+    auto& _epp = ep_profiler();
+    const bool _prof = _epp.enabled;
+    auto _t_shapecheck0 = _prof ? ep_clock::now() : ep_clock::time_point{};
+
     if (!compute_state.has_input_shapes) {
         for (auto& [name, index] : input_name_indices) {
             auto value{kernel_context.GetInput(index)};
@@ -1059,6 +1099,9 @@ Ort::Status NodeComputeInfo::Compute(ComputeState& compute_state, const Ort::Ker
         param_shapes = program.get_parameter_shapes();
     }
 
+    auto _t_rebind0 = ep_clock::now();
+    double _d_shapecheck = _prof ? std::chrono::duration<double, std::milli>(_t_rebind0 - _t_shapecheck0).count() : 0;
+
     migraphx::program_parameters compute_params;
     auto output_shapes{program.get_output_shapes()};
     std::vector<size_t> output_indices;
@@ -1103,8 +1146,27 @@ Ort::Status NodeComputeInfo::Compute(ComputeState& compute_state, const Ort::Ker
 
         HIP_RETURN_IF_ERROR(hipSetDevice(compute_state.device_id));
         auto hip_stream{static_cast<hipStream_t>(kernel_context.GetGPUComputeStream())};
+        auto _t_enq0 = _prof ? ep_clock::now() : ep_clock::time_point{};
+        double _d_rebind = _prof ? std::chrono::duration<double, std::milli>(_t_enq0 - _t_rebind0).count() : 0;
         auto prog_outputs{program.run_async(compute_params, hip_stream)};
+        auto _t_sync0 = _prof ? ep_clock::now() : ep_clock::time_point{};
+        double _d_enqueue = _prof ? std::chrono::duration<double, std::milli>(_t_sync0 - _t_enq0).count() : 0;
         HIP_RETURN_IF_ERROR(hipStreamSynchronize(hip_stream));
+        if (_prof) {
+            double _d_sync = ms_since(_t_sync0);
+            _epp.calls++;
+            if (_epp.calls > _epp.warmup_skip) {  // skip prefill + cold tokens
+                _epp.t_shapecheck += _d_shapecheck;
+                _epp.t_rebind += _d_rebind;
+                _epp.t_enqueue += _d_enqueue;
+                _epp.t_sync += _d_sync;
+                _epp.win_tokens++;
+                if (_epp.report_every > 0 && (_epp.win_tokens % _epp.report_every) == 0) {
+                    _epp.report();
+                    _epp.reset_window();
+                }
+            }
+        }
 
         if (auto output_size{prog_outputs.size()}; output_indices.size() < output_size) {
             for (size_t i{}; i < output_size; ++i) {
