@@ -1,0 +1,56 @@
+// Copyright (c) Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+#include "gpu_options.h"
+#include "gpu_info.h"
+
+#include "common/parse_string.h"
+#include "common/provider_options_utils.h"
+
+namespace gpu_ep {
+
+ProviderInfo::ProviderInfo(const ProviderOptions& provider_options) {
+    THROW_IF_ERROR(
+        ProviderOptionsParser{}
+            .AddValueParser(
+                provider_option::kProfile,
+                [this](const std::string_view value) -> Ort::Status {
+                    std::string lower{value};
+                    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                    if (lower == "auto" || value == "0" || value.empty()) {
+                        profile = Profile::Auto;
+                    } else if (lower == "eager" || value == "1") {
+                        profile = Profile::Eager;
+                    } else if (lower == "optimize" || value == "2") {
+                        profile = Profile::Optimized;
+                    } else if (lower == "migraphx" || value == "3") {
+                        profile = Profile::MIGraphX;
+                    } else if (lower == "directx" || value == "4") {
+                        profile = Profile::DirectX;
+                    } else if (lower == "hip" || value == "5") {
+                        profile = Profile::Hip;
+                    } else {
+                        return MAKE_STATUS(ORT_FAIL, "unknown profile: '", value, "'");
+                    }
+                    return STATUS_OK;
+                })
+            .AddAssignmentToReference(provider_option::kDeviceId, device_id)
+            .AddAssignmentToReference(provider_option::kDisableCaching, disable_caching)
+            .AddAssignmentToReference(provider_option::kCacheDir, cache_dir)
+            .AddAssignmentToReference(provider_option::kForceRecompile, force_recompile)
+            .AddAssignmentToReference(provider_option::kExhaustiveTune, exhaustive_tune)
+            .AddAssignmentToReference(provider_option::kComputeMode, compute_mode)
+            .AddAssignmentToReference(provider_option::kMlssUseSpecificOps, mlss_use_specific_ops)
+            .AddAssignmentToReference(provider_option::kCpuControlFlow, cpu_control_flow)
+            .AddAssignmentToReference(provider_option::kModelArch, model_arch)
+            .AddAssignmentToReference(provider_option::kModelFw, model_fw)
+            .AddAssignmentToReference(provider_option::kHipGraphEnable, hip_graph_enable)
+            .AddAssignmentToReference(provider_option::kStaticPadSeq, static_pad_seq)
+            .AddAssignmentToReference(provider_option::kStaticPadSeqLen, static_pad_seq_len)
+            .AddAssignmentToReference(provider_option::kStaticPadInputs, static_pad_inputs)
+            .AddAssignmentToReference(provider_option::kStaticPadOutputs, static_pad_outputs)
+            .IgnoreUnknownKeys()
+            .Parse(provider_options));
+}
+
+}  // namespace gpu_ep

@@ -1,0 +1,641 @@
+// Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
+// Licensed under the MIT License
+
+#pragma once
+
+#include <optional>
+#include "dml_client.h"
+
+#ifdef DML_PERF_PROFILE
+#include <atomic>
+#include <chrono>
+#endif
+
+#include "DmlExecutionProvider/DmlEdgeShapes.h"
+
+// Forward declarations
+namespace dml_ep {
+    class AttributeValue;
+    using AttributeMap = std::map<std::string, AttributeValue>;
+}
+
+// IWinmlExecutionProvider must be fully defined before this header is parsed
+// because AbiSafeKernelContext holds Microsoft::WRL::ComPtr<IWinmlExecutionProvider>.
+// Include dml_execution_provider.h or IWinmlExecutionProvider.h before this header.
+// (dml_abi_kernel.cpp does this explicitly; other TUs reach it via precomp.h or dml_ep.h.)
+
+namespace dml_ep {
+
+// Forward declarations
+class PluginDmlExecutionProviderImpl;
+
+// Bundles a pre-uploaded D3D12_HEAP_TYPE_DEFAULT GPU buffer with the shape and dtype of the
+// constant tensor it holds. Used by the safe path to serve constant/initializer inputs without
+// re-uploading on each Compute() call. Owned by DmlAbiKernel; referenced (non-owning pointer
+// to the vector) by AbiSafeKernelContext during each Compute().
+struct ConstantGpuResource {
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;  // null = slot not cached
+    std::vector<uint32_t> shape;
+    MLOperatorTensorDataType dtype = MLOperatorTensorDataType::Undefined;
+};
+
+// ============================================================================
+// ABI-Safe Tensor Wrapper - implements IMLOperatorTensor using C API
+// ============================================================================
+
+class AbiSafeTensor : public Microsoft::WRL::RuntimeClass<
+    Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
+    IMLOperatorTensor>
+{
+public:
+    AbiSafeTensor(
+        const OrtValue* ort_value,
+        const OrtApi* ort_api,
+        const PluginDmlExecutionProviderImpl* execution_provider,
+        bool is_internal_operator = false);
+
+    // IMLOperatorTensor methods - implemented using only C API
+    STDMETHOD_(uint32_t, GetDimensionCount)() const noexcept override;
+    STDMETHOD(GetShape)(uint32_t dimensionCount, uint32_t* dimensions) const noexcept override;
+    STDMETHOD_(MLOperatorTensorDataType, GetTensorDataType)() const noexcept override;
+    STDMETHOD_(bool, IsCpuData)() const noexcept override;
+    STDMETHOD_(bool, IsDataInterface)() const noexcept override;
+    STDMETHOD_(void*, GetData)() noexcept override;
+    STDMETHOD_(void, GetDataInterface)(IUnknown** dataInterface) noexcept override;
+
+private:
+    const OrtValue* ort_value_;
+    const OrtApi* ort_api_;
+    const PluginDmlExecutionProviderImpl* execution_provider_;
+    bool is_internal_operator_;
+
+    // Eagerly cached state — resolved once in constructor, returned directly by accessors.
+    // Mirrors ORT's TensorWrapper which pre-computes m_abiDataInterface in its constructor.
+    bool cached_is_cpu_ = true;
+    MLOperatorTensorDataType cached_dtype_ = MLOperatorTensorDataType::Undefined;
+    std::vector<uint32_t> cached_shape_;
+    void* cached_data_ = nullptr;
+    Microsoft::WRL::ComPtr<IUnknown> cached_abi_data_interface_;
+};
+
+// ============================================================================
+// GPU-Resident Constant Tensor - wraps a pre-uploaded ID3D12Resource
+// ============================================================================
+
+// Wraps a D3D12_HEAP_TYPE_DEFAULT buffer that was uploaded once at kernel-creation time.
+// Used by the safe path to serve constant/initializer inputs without re-uploading on each
+// Compute() call. Shape and dtype are captured at upload time.
+class AbiSafeD3D12Tensor : public Microsoft::WRL::RuntimeClass<
+    Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
+    IMLOperatorTensor>
+{
+public:
+    AbiSafeD3D12Tensor(
+        ID3D12Resource* resource,
+        std::vector<uint32_t> shape,
+        MLOperatorTensorDataType dtype);
+
+    STDMETHOD_(uint32_t, GetDimensionCount)() const noexcept override;
+    STDMETHOD(GetShape)(uint32_t dimensionCount, uint32_t* dimensions) const noexcept override;
+    STDMETHOD_(MLOperatorTensorDataType, GetTensorDataType)() const noexcept override;
+    STDMETHOD_(bool, IsCpuData)() const noexcept override { return false; }
+    STDMETHOD_(bool, IsDataInterface)() const noexcept override { return true; }
+    STDMETHOD_(void*, GetData)() noexcept override { return nullptr; }
+    STDMETHOD_(void, GetDataInterface)(IUnknown** dataInterface) noexcept override;
+
+private:
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
+    std::vector<uint32_t> shape_;
+    MLOperatorTensorDataType dtype_;
+};
+
+// ============================================================================
+// ABI-Safe Kernel Context - implements IMLOperatorKernelContext using C API
+// ============================================================================
+
+class AbiSafeKernelContext : public Com<IMLOperatorKernelContext, IMLOperatorKernelContextPrivate>
+{
+public:
+    AbiSafeKernelContext(
+        OrtKernelContext* kernel_context,
+        const OrtApi* ort_api,
+        const PluginDmlExecutionProviderImpl* execution_provider,
+        bool is_internal_operator,
+        std::string_view ep_name,
+        const std::vector<std::optional<std::vector<uint32_t>>>* inferred_output_shapes = nullptr,
+        IMLOperatorShapeInferrer* shape_inferrer = nullptr,
+        const std::vector<uint32_t>* required_constant_cpu_inputs = nullptr,
+        const AttributeMap* default_attributes = nullptr,
+        const OrtKernelInfo* kernel_info = nullptr,
+        const std::vector<ConstantGpuResource>* constant_gpu_resources = nullptr);
+
+    // Refresh only the per-call-varying state so this context object can be reused across Compute
+    // calls instead of being reconstructed each call. Sets the current OrtKernelContext*, drops the
+    // cached per-input/output tensor wrappers (their OrtValue* are valid for one Compute only), and
+    // re-runs GetABIExecutionInterfaceAndInvalidateState — a required per-call side effect that
+    // refreshes the current command list and invalidates descriptor-heap state. Caller must
+    // guarantee input/output counts are unchanged (i.e. shapes unchanged) since the tensor caches
+    // are only cleared, not resized.
+    void ResetForNewToken(OrtKernelContext* kernel_context) noexcept;
+
+    // IMLOperatorKernelContext methods - implemented using only C API
+    STDMETHOD(GetInputTensor)(uint32_t inputIndex, IMLOperatorTensor** tensor) const noexcept override;
+    STDMETHOD(GetOutputTensor)(uint32_t outputIndex, IMLOperatorTensor** tensor) noexcept override;
+    STDMETHOD(GetOutputTensor)(uint32_t outputIndex, uint32_t dimensionCount, const uint32_t* dimensionSizes,
+        IMLOperatorTensor** tensor) noexcept override;
+    STDMETHOD(AllocateTemporaryData)(size_t size, IUnknown** data) const noexcept override;
+    STDMETHOD_(void, GetExecutionInterface)(IUnknown** executionInterface) const noexcept override;
+
+    // IMLOperatorKernelContextPrivate methods
+    STDMETHOD(GetSequenceInputTensor)(uint32_t inputIndex, uint32_t sequenceIndex, IMLOperatorTensor** tensor) const noexcept override;
+    STDMETHOD(PrepareSequenceOutput)(uint32_t outputIndex, MLOperatorTensorDataType dataType) const noexcept override;
+    STDMETHOD(GetSequenceOutputTensor)(uint32_t outputIndex, uint32_t sequenceIndex, MLOperatorTensorDataType dataType,
+        uint32_t dimensions, const uint32_t* dimensionSizes, bool gpuOutput, IMLOperatorTensor** tensor) const noexcept override;
+    STDMETHOD(GetSequenceInputInfo)(uint32_t inputIndex, uint32_t* inputCount, MLOperatorTensorDataType* dataType) const noexcept override;
+    STDMETHOD_(bool, IsSequenceInputTensor)(uint32_t inputIndex) const noexcept override;
+
+private:
+    OrtKernelContext* kernel_context_;
+    const OrtApi* ort_api_;
+    const PluginDmlExecutionProviderImpl* execution_provider_;
+    bool is_internal_operator_;  // Controls GetABIDataInterface and GetExecutionInterface return type
+    const std::vector<std::optional<std::vector<uint32_t>>>* inferred_output_shapes_;
+    mutable std::vector<Microsoft::WRL::ComPtr<AbiSafeTensor>> input_tensor_cache_;
+    mutable std::vector<Microsoft::WRL::ComPtr<AbiSafeTensor>> output_tensor_cache_;
+    size_t input_count_ = 0;
+    size_t output_count_ = 0;
+    mutable Microsoft::WRL::ComPtr<IUnknown> abi_execution_object_;
+    Microsoft::WRL::ComPtr<IWinmlExecutionProvider> winml_provider_;
+
+    // For runtime shape inference (e.g., Reshape with constant shape input)
+    IMLOperatorShapeInferrer* shape_inferrer_;
+    const std::vector<uint32_t>* required_constant_cpu_inputs_;
+    const AttributeMap* default_attributes_;
+    const OrtKernelInfo* kernel_info_ = nullptr;  // For AbiSafeShapeInferenceContext attribute reads
+
+    // Runtime EP name used for allocator lookup in AllocateTemporaryData. Previously hardcoded
+    // as "DirectMLExecutionProvider"; now supplied by the caller at construction time.
+    std::string ep_name_;
+
+    // Pre-uploaded GPU resources for constant inputs. Indexed by input index (sparse).
+    // Non-null resource = D3D12_HEAP_TYPE_DEFAULT buffer uploaded once at kernel-creation time.
+    const std::vector<ConstantGpuResource>* constant_gpu_resources_ = nullptr;
+};
+
+// ============================================================================
+// ABI-Safe Shape Inference Context - for runtime shape inference
+// ============================================================================
+
+class AbiSafeShapeInferenceContext : public Microsoft::WRL::RuntimeClass<
+    Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
+    Microsoft::WRL::ChainInterfaces<IMLOperatorShapeInferenceContextPrivate, IMLOperatorShapeInferenceContext>>
+{
+public:
+    AbiSafeShapeInferenceContext(
+        OrtKernelContext* kernel_context,
+        const OrtApi* ort_api,
+        const AttributeMap* default_attributes,
+        const PluginDmlExecutionProviderImpl* execution_provider,
+        const OrtKernelInfo* kernel_info = nullptr);
+
+    // IMLOperatorAttributes methods
+    STDMETHOD(GetAttributeElementCount)(
+        _In_z_ const char* name,
+        MLOperatorAttributeType type,
+        _Out_ uint32_t* elementCount) const noexcept override;
+
+    STDMETHOD(GetAttribute)(
+        _In_z_ const char* name,
+        MLOperatorAttributeType type,
+        uint32_t elementCount,
+        size_t elementByteSize,
+        _Out_writes_bytes_(elementCount * elementByteSize) void* value) const noexcept override;
+
+    STDMETHOD(GetStringAttributeElementLength)(
+        _In_z_ const char* name,
+        uint32_t elementIndex,
+        _Out_ uint32_t* attributeElementByteLength) const noexcept override;
+
+    STDMETHOD(GetStringAttributeElement)(
+        _In_z_ const char* name,
+        uint32_t elementIndex,
+        uint32_t attributeElementByteLength,
+        _Out_writes_(attributeElementByteLength) char* attributeElement) const noexcept override;
+
+    // IMLOperatorShapeInferenceContext methods
+    STDMETHOD_(uint32_t, GetInputCount)() const noexcept override;
+    STDMETHOD_(uint32_t, GetOutputCount)() const noexcept override;
+    STDMETHOD_(bool, IsInputValid)(uint32_t inputIndex) const noexcept override;
+    STDMETHOD_(bool, IsOutputValid)(uint32_t outputIndex) const noexcept override;
+
+    STDMETHOD(GetInputEdgeDescription)(
+        uint32_t inputIndex,
+        _Out_ MLOperatorEdgeDescription* edgeDescription) const noexcept override;
+
+    STDMETHOD(GetInputTensorDimensionCount)(
+        uint32_t inputIndex,
+        _Out_ uint32_t* dimensionCount) const noexcept override;
+
+    STDMETHOD(GetInputTensorShape)(
+        uint32_t inputIndex,
+        uint32_t dimensionCount,
+        _Out_writes_(dimensionCount) uint32_t* dimensions) const noexcept override;
+
+    STDMETHOD(SetOutputTensorShape)(
+        uint32_t outputIndex,
+        uint32_t dimensionCount,
+        const uint32_t* dimensions) noexcept override;
+
+    // IMLOperatorShapeInferenceContextPrivate methods
+    STDMETHOD(GetConstantInputTensor)(
+        uint32_t inputIndex,
+        _Outptr_ IMLOperatorTensor** tensor) const noexcept override;
+
+    STDMETHOD(TryGetConstantInputTensor)(
+        uint32_t inputIndex,
+        _Outptr_ IMLOperatorTensor** tensor) const noexcept override;
+
+    STDMETHOD(GetSequenceInputInfo)(
+        uint32_t inputIndex,
+        _Out_ uint32_t* inputCount,
+        MLOperatorTensorDataType* dataType) const noexcept override;
+
+    STDMETHOD(GetSequenceInputTensorDimensionCount)(
+        uint32_t inputIndex,
+        uint32_t sequenceIndex,
+        _Out_ uint32_t* dimensionCount) const noexcept override;
+
+    STDMETHOD(GetSequenceInputTensorShape)(
+        uint32_t inputIndex,
+        uint32_t sequenceIndex,
+        uint32_t dimensionCount,
+        _Out_writes_(dimensionCount) uint32_t* dimensions) const noexcept override;
+
+    // Retrieve inferred output shapes after calling shape inferrer.
+    // Each entry is nullopt if SetOutputTensorShape was never called for that output,
+    // or an optional<vector> (possibly empty for scalars) if it was explicitly set.
+    const std::vector<std::optional<std::vector<uint32_t>>>& GetInferredOutputShapes() const { return inferred_output_shapes_; }
+
+private:
+    OrtKernelContext* kernel_context_;
+    const OrtApi* ort_api_;
+    const AttributeMap* default_attributes_;
+    const PluginDmlExecutionProviderImpl* execution_provider_;
+    const OrtKernelInfo* kernel_info_;  // For accessing actual node attributes
+
+    // Stores output shapes set by the shape inferrer.
+    // nullopt = never set; optional<vector>{} = explicitly set as scalar (0-dim).
+    std::vector<std::optional<std::vector<uint32_t>>> inferred_output_shapes_;
+
+    // Cache for constant input tensors
+    mutable std::unordered_map<uint32_t, Microsoft::WRL::ComPtr<AbiSafeTensor>> constant_tensor_cache_;
+};
+
+// ============================================================================
+// ABI-Safe Kernel Creation Context - implements IMLOperatorKernelCreationContext using C API
+// ============================================================================
+
+// Pre-fetched tensor attribute data — plain bytes, no protobuf types.
+// Populated before AbiSafeKernelCreationContext construction by TryFetchTensorAttribute().
+struct PreFetchedTensorAttr {
+    MLOperatorTensorDataType data_type = MLOperatorTensorDataType::Undefined;
+    std::vector<uint32_t> shape;
+    std::vector<std::byte> raw_bytes;
+};
+
+// ABI-safe IMLOperatorTensor wrapping pre-fetched tensor attribute bytes.
+// Owns its data; no protobuf pointers. Used as the return value of GetTensorAttribute().
+// Implementation is in dml_abi_kernel.cpp to avoid inline WRL template instantiation in the header,
+// which would require IWinmlExecutionProvider (a heavy ORT-internal type) to be fully defined.
+class PreFetchedTensorAttrWrapper : public Microsoft::WRL::RuntimeClass<
+    Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
+    IMLOperatorTensor>
+{
+public:
+    PreFetchedTensorAttrWrapper(
+        MLOperatorTensorDataType data_type,
+        std::vector<uint32_t> shape,
+        std::vector<std::byte> raw_bytes);
+
+    STDMETHOD_(uint32_t, GetDimensionCount)() const noexcept override;
+    STDMETHOD(GetShape)(uint32_t dim_count, uint32_t* dims) const noexcept override;
+    STDMETHOD_(MLOperatorTensorDataType, GetTensorDataType)() const noexcept override;
+    STDMETHOD_(bool, IsCpuData)() const noexcept override;
+    STDMETHOD_(bool, IsDataInterface)() const noexcept override;
+    STDMETHOD_(void*, GetData)() noexcept override;
+    STDMETHOD_(void, GetDataInterface)(IUnknown** dataInterface) noexcept override;
+
+private:
+    MLOperatorTensorDataType data_type_;
+    std::vector<uint32_t> shape_;
+    std::vector<std::byte> raw_bytes_;
+};
+
+class AbiSafeKernelCreationContext : public Microsoft::WRL::RuntimeClass<
+    Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
+    Microsoft::WRL::ChainInterfaces<IMLOperatorKernelCreationContextNodeWrapperPrivate, IMLOperatorKernelCreationContextPrivate, IMLOperatorKernelCreationContext>,
+    IMLOperatorTensorShapeDescription,
+    IMLOperatorAttributes1>
+{
+public:
+    AbiSafeKernelCreationContext(
+        const OrtKernelInfo* kernel_info,
+        const OrtApi* ort_api,
+        const AttributeMap* default_attributes,
+        const std::vector<uint32_t>* required_constant_cpu_inputs,
+        const PluginDmlExecutionProviderImpl* execution_provider,
+        std::unordered_map<uint32_t, Microsoft::WRL::ComPtr<IMLOperatorTensor>>&& constant_tensors = {},
+        OrtKernelContext* runtime_context = nullptr,  // For lazy init with runtime shapes
+        const char* operator_name = nullptr,  // For operator-specific logic
+        bool is_internal_operator = false,  // Controls GetExecutionInterface return value
+        bool requires_input_shapes_at_creation = true,  // Mirrors old m_allowInputShapeQuery
+        std::unordered_map<std::string, PreFetchedTensorAttr> tensor_attribute_cache = {},  // Pre-fetched tensor attrs
+        const EdgeShapes* input_shapes_override = nullptr,  // Runtime shapes (lazy-init)
+        bool requires_output_shapes_at_creation = false);  // Mirrors old m_allowOutputShapeQuery
+
+    // IMLOperatorKernelCreationContext methods
+    STDMETHOD_(uint32_t, GetInputCount)() const noexcept override;
+    STDMETHOD_(uint32_t, GetOutputCount)() const noexcept override;
+    STDMETHOD_(bool, IsInputValid)(uint32_t inputIndex) const noexcept override;
+    STDMETHOD_(bool, IsOutputValid)(uint32_t outputIndex) const noexcept override;
+    STDMETHOD(GetInputEdgeDescription)(uint32_t inputIndex, MLOperatorEdgeDescription* edgeDesc) const noexcept override;
+    STDMETHOD(GetOutputEdgeDescription)(uint32_t outputIndex, MLOperatorEdgeDescription* edgeDesc) const noexcept override;
+    STDMETHOD_(bool, HasTensorShapeDescription)() const noexcept override;
+    STDMETHOD(GetTensorShapeDescription)(IMLOperatorTensorShapeDescription** shapeInfo) const noexcept override;
+    STDMETHOD_(void, GetExecutionInterface)(IUnknown** executionInterface) const noexcept override;
+
+    // IMLOperatorAttributes methods
+    STDMETHOD(GetAttribute)(_In_z_ const char* name, MLOperatorAttributeType type,
+        uint32_t elementCount, size_t elementByteSize, void* value) const noexcept override;
+    STDMETHOD(GetAttributeElementCount)(_In_z_ const char* name, MLOperatorAttributeType type, uint32_t* elementCount) const noexcept override;
+    STDMETHOD(GetStringAttributeElementLength)(_In_z_ const char* name, uint32_t elementIndex, uint32_t* attributeElementByteSize) const noexcept override;
+    STDMETHOD(GetStringAttributeElement)(_In_z_ const char* name, uint32_t elementIndex, uint32_t attributeElementByteSize,
+        char* attributeElement) const noexcept override;
+
+    // IMLOperatorAttributes1 methods
+    STDMETHOD(GetTensorAttribute)(_In_z_ const char* name, _COM_Outptr_ IMLOperatorTensor** tensor) const noexcept override;
+
+    // IMLOperatorKernelCreationContextPrivate methods
+    STDMETHOD(GetConstantInputTensor)(uint32_t inputIndex, IMLOperatorTensor** tensor) const noexcept override;
+    STDMETHOD(TryGetConstantInputTensor)(uint32_t inputIndex, IMLOperatorTensor** tensor) const noexcept override;
+    STDMETHOD_(bool, IsDmlGraphNode)() const noexcept override { return false; }
+    STDMETHOD(SetDmlOperator)(_In_ const MLOperatorGraphDesc* operatorGraphDesc) const noexcept override { return E_NOTIMPL; }
+
+    // IMLOperatorKernelCreationContextNodeWrapperPrivate methods - for node name access
+    STDMETHOD_(uint32_t, GetUtf8NameBufferSizeInBytes)() const noexcept override;
+    STDMETHOD(GetUtf8Name)(uint32_t bufferSizeInBytes, _Out_writes_bytes_(bufferSizeInBytes) char* name) const noexcept override;
+    STDMETHOD_(uint32_t, GetWideNameBufferSizeInBytes)() const noexcept override;
+    STDMETHOD(GetWideName)(uint32_t bufferSizeInBytes, _Out_writes_bytes_(bufferSizeInBytes) wchar_t* name) const noexcept override;
+    STDMETHOD(GetExecutionProvider)(_Outptr_result_maybenull_ IUnknown** executionProvider) const noexcept override;
+
+    // IMLOperatorTensorShapeDescription methods - implemented using C API
+    STDMETHOD(GetInputTensorDimensionCount)(uint32_t inputIndex, _Out_ uint32_t* dimensionCount) const noexcept override;
+    STDMETHOD(GetInputTensorShape)(uint32_t inputIndex, uint32_t dimensionCount, _Out_writes_(dimensionCount) uint32_t* dimensions) const noexcept override;
+    STDMETHOD_(bool, HasOutputShapeDescription)() const noexcept override;
+    STDMETHOD(GetOutputTensorDimensionCount)(uint32_t outputIndex, _Out_ uint32_t* dimensionCount) const noexcept override;
+    STDMETHOD(GetOutputTensorShape)(uint32_t outputIndex, uint32_t dimensionCount, _Out_writes_(dimensionCount) uint32_t* dimensions) const noexcept override;
+
+    // Set pre-computed output shapes (e.g., from shape inferrer).
+    // Each entry is nullopt if not set, or optional<vector> (possibly empty for scalars) if explicitly set.
+    void SetPrecomputedOutputShapes(const std::vector<std::optional<std::vector<uint32_t>>>& shapes) {
+        precomputed_output_shapes_ = shapes;
+    }
+
+private:
+    const OrtKernelInfo* kernel_info_;
+    const OrtApi* ort_api_;
+    const AttributeMap* default_attributes_;
+    const std::vector<uint32_t>* required_constant_cpu_inputs_;
+    const PluginDmlExecutionProviderImpl* execution_provider_;
+
+    // Pre-fetched constant tensors (ABI-safe, no unsafe casts)
+    std::unordered_map<uint32_t, Microsoft::WRL::ComPtr<IMLOperatorTensor>> constant_tensors_;
+
+    // For lazy initialization - get shapes from actual runtime tensors
+    OrtKernelContext* runtime_context_ = nullptr;
+    const char* operator_name_ = nullptr;
+    bool is_internal_operator_ = false;  // Controls GetExecutionInterface (ID3D12GraphicsCommandList* vs provider)
+    // Captured runtime input shapes (mirrors old plugin's m_inputShapesOverride passed to PluginOpKernelInfoWrapper)
+    const EdgeShapes* input_shapes_override_ = nullptr;
+    bool requires_input_shapes_at_creation_ = true;   // Mirrors old m_allowInputShapeQuery static flag
+    bool requires_output_shapes_at_creation_ = false; // Mirrors old m_allowOutputShapeQuery static flag
+
+    // Pre-computed output shapes from shape inferrer (takes precedence over fallback logic).
+    // nullopt = never set; optional<vector>{} = explicitly set as scalar (0-dim).
+    std::vector<std::optional<std::vector<uint32_t>>> precomputed_output_shapes_;
+
+    // Pre-fetched tensor attribute cache (ABI-safe, no protobuf). Populated at construction
+    // by TryFetchTensorAttribute() called at each AbiSafeKernelCreationContext creation site.
+    std::unordered_map<std::string, PreFetchedTensorAttr> tensor_attribute_cache_;
+
+    // Cached ABI execution object. GetABIExecutionInterfaceAndInvalidateState is called exactly
+    // once in the constructor (matching PluginOpKernelInfoWrapper behavior). GetExecutionInterface
+    // returns this cached value rather than calling the invalidating function on every access.
+    Microsoft::WRL::ComPtr<IUnknown> abi_execution_object_;
+};
+
+// ============================================================================
+// Kernel Creation and Storage
+// ============================================================================
+
+// State for ABI-safe kernel creation
+struct DmlKernelCreationState {
+    IMLOperatorKernelFactory* kernel_factory = nullptr;
+    IMLOperatorShapeInferrer* shape_inferrer = nullptr;
+    const AttributeMap* default_attributes = nullptr;
+
+    std::vector<uint32_t> required_constant_cpu_inputs;
+    bool requires_input_shapes_at_creation = false;
+    bool requires_output_shapes_at_creation = false;
+    bool is_internal_operator = false;  // Controls GetABIDataInterface and GetExecutionInterface return type
+    std::vector<std::string> tensor_attribute_names;  // Tensor-typed ONNX attribute names (e.g., ConstantOfShape's "value")
+
+    const PluginDmlExecutionProviderImpl* dml_execution_provider = nullptr;
+    const OrtApi* ort_api = nullptr;
+    const char* operator_name = nullptr;  // For debugging
+    std::string ep_name;  // Runtime EP name, propagated to DmlAbiKernel for allocator lookup
+};
+
+// Snapshot of a constant CPU input tensor's content, used to detect value changes between Compute
+// calls. Mirrors the TensorContent struct in PluginDmlAbiOpKernel (MLOperatorAuthorImpl.h:598).
+struct TensorContent {
+    bool isValid = false;
+    std::vector<uint32_t> shape;
+    MLOperatorTensorDataType type = MLOperatorTensorDataType::Undefined;
+    std::vector<std::byte> data;
+};
+
+// ============================================================================
+// Snapshot Tensor - presents a TensorContent snapshot as IMLOperatorTensor
+// Used in the shape-change path to re-supply constants originally fetched at
+// kernel creation time (e.g. Pad's pads input which KernelInfoGetConstantInput
+// cannot see at compute time via the plugin EP's OrtKernelInfo*).
+// ============================================================================
+
+class SnapshotTensor : public Microsoft::WRL::RuntimeClass<
+    Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
+    IMLOperatorTensor>
+{
+public:
+    explicit SnapshotTensor(const TensorContent& content) : content_(content) {}
+
+    STDMETHOD_(uint32_t, GetDimensionCount)() const noexcept override {
+        return static_cast<uint32_t>(content_.shape.size());
+    }
+
+    STDMETHOD(GetShape)(uint32_t dimensionCount, uint32_t* dimensions) const noexcept override {
+        if (!dimensions) return E_POINTER;
+        const uint32_t actual = static_cast<uint32_t>(content_.shape.size());
+        const uint32_t count = std::min(dimensionCount, actual);
+        for (uint32_t i = 0; i < count; ++i) dimensions[i] = content_.shape[i];
+        return S_OK;
+    }
+
+    STDMETHOD_(MLOperatorTensorDataType, GetTensorDataType)() const noexcept override {
+        return content_.type;
+    }
+
+    STDMETHOD_(bool, IsCpuData)() const noexcept override { return true; }
+
+    STDMETHOD_(bool, IsDataInterface)() const noexcept override { return false; }
+
+    STDMETHOD_(void*, GetData)() noexcept override {
+        if (content_.data.empty()) return nullptr;
+        return const_cast<std::byte*>(content_.data.data());
+    }
+
+    STDMETHOD_(void, GetDataInterface)(IUnknown** dataInterface) noexcept override {
+        if (dataInterface) *dataInterface = nullptr;
+    }
+
+private:
+    TensorContent content_;
+};
+
+#ifdef DML_PERF_PROFILE
+// Per-kernel counters accumulated across all Compute() calls.
+// All fields are std::atomic so they can be incremented without locks from Compute().
+struct DmlAbiKernelPerfCounters {
+    std::atomic<uint64_t> compute_calls{0};
+    std::atomic<uint64_t> shape_change_checks{0};   // times shape-change detection path ran
+    std::atomic<uint64_t> shape_changes_detected{0}; // times a shape/const change was found
+    std::atomic<uint64_t> lazy_inits{0};             // times lazy init ran
+    // Accumulated nanoseconds for each logical section of Compute()
+    std::atomic<uint64_t> ns_context_construction{0};
+    std::atomic<uint64_t> ns_transition_pre{0};
+    std::atomic<uint64_t> ns_kernel_compute{0};
+    std::atomic<uint64_t> ns_transition_post{0};
+    std::atomic<uint64_t> ns_shape_change_check{0};
+};
+#endif
+
+// ABI-safe kernel - stores DML operator directly
+struct DmlAbiKernel {
+    Microsoft::WRL::ComPtr<IMLOperatorKernel> ml_operator_kernel;
+    const OrtApi* ort_api = nullptr;
+    const PluginDmlExecutionProviderImpl* dml_execution_provider = nullptr;
+    bool is_internal_operator = false;  // Controls GetABIDataInterface and GetExecutionInterface return type
+    std::string ep_name;  // Runtime EP name for allocator lookup in AbiSafeKernelContext
+    std::vector<std::optional<std::vector<uint32_t>>> inferred_output_shapes;  // nullopt=unset, empty vector=scalar
+    std::string operator_name;  // For debugging
+
+    // Profiling - only active when DML_PERF_PROFILE=1
+#ifdef DML_PERF_PROFILE
+    std::unique_ptr<DmlAbiKernelPerfCounters> perf;
+#endif
+
+    // For runtime shape inference (e.g., Reshape with constant shape input)
+    Microsoft::WRL::ComPtr<IMLOperatorShapeInferrer> shape_inferrer;
+    std::vector<uint32_t> required_constant_cpu_inputs;
+    const AttributeMap* default_attributes = nullptr;
+
+    // For lazy kernel creation when shapes are dynamic
+    bool needs_lazy_init = false;  // True if kernel wasn't created yet due to dynamic shapes
+    bool requires_input_shapes_at_creation = false;  // Static flag for HasTensorShapeDescription
+    bool requires_output_shapes_at_creation = false;  // When true, shape inferrer must run before CreateKernel
+    Microsoft::WRL::ComPtr<IMLOperatorKernelFactory> kernel_factory;  // Factory to create kernel lazily
+    const OrtKernelInfo* kernel_info = nullptr;  // Stored for lazy initialization (lifetime managed by ORT)
+
+    // For resource state transitions and QueueReference after Compute
+    Microsoft::WRL::ComPtr<IWinmlExecutionProvider> winml_provider;
+
+    // Names of tensor-typed ONNX attributes (e.g., ConstantOfShape's "value") — for ABI-safe attribute fetch
+    std::vector<std::string> tensor_attribute_names;
+
+    // For shape-change detection between Compute calls (mirrors m_inputShapesOfKernelInference in unsafe path)
+    EdgeShapes input_shapes_of_kernel_inference;
+
+    // Reused across Compute calls on the steady-state fast path. Built once on the first fast-path
+    // Compute and refreshed via ResetForNewToken() thereafter, avoiding a fresh AbiSafeKernelContext
+    // (and its cache-vector allocations + QueryInterface) on every Compute. Nulled whenever the
+    // shape-change branch fires so it is rebuilt with correct input/output counts. Assumes Compute is
+    // not called concurrently on one kernel (graph exec is sequential), same as needs_lazy_init /
+    // input_shapes_of_kernel_inference.
+    Microsoft::WRL::ComPtr<AbiSafeKernelContext> cached_context;
+
+    // Scratch reused by the shape-change guard to avoid allocating a fresh EdgeShapes (and per-input
+    // dim vectors) on every Compute. The full C-API shape re-read and comparison are unchanged; only
+    // the allocation is hoisted out of the per-call path.
+    EdgeShapes shape_scratch;
+
+    // Snapshots of required constant CPU input values from the last kernel creation. Indexed by input
+    // index (sparse — only indices in required_constant_cpu_inputs are populated). Used to detect value
+    // changes between calls when shapes are unchanged. Mirrors m_constantInputTensorContentsOfKernel
+    // in PluginDmlAbiOpKernel. Only the tensor (non-sequence) case is needed here since sequence-typed
+    // constant CPU inputs do not occur for DML operators.
+    std::vector<TensorContent> constant_input_tensor_contents;
+
+    // Pre-uploaded GPU resources for required_constant_cpu_inputs (safe path only).
+    // Indexed by input index (sparse — null resource = slot not cached). Each entry is
+    // populated at kernel-creation time by UploadConstantTensorsToGpu(). AbiSafeKernelContext
+    // holds a non-owning pointer to this vector and serves cached entries from GetInputTensor()
+    // instead of re-uploading on every Compute(). ComPtr lifetime = kernel object lifetime.
+    std::vector<ConstantGpuResource> constant_gpu_resources;
+};
+
+// Pre-fetches tensor-typed attributes from kernel_info into an ABI-safe cache map.
+// Enumerates only the names listed in tensor_attribute_names — fully ABI-safe (ORT C API only).
+std::unordered_map<std::string, PreFetchedTensorAttr>
+FetchAllTensorAttributes(
+    const OrtKernelInfo* kernel_info,
+    const OrtApi* ort_api,
+    const std::vector<std::string>& tensor_attribute_names);
+
+// C API kernel creation function
+OrtStatus* ORT_API_CALL DmlAbiKernel_Create(
+    void* kernel_create_state,
+    const OrtKernelInfo* kernel_info,
+    OrtKernelImpl** kernel_out,
+    std::unordered_map<uint32_t, Microsoft::WRL::ComPtr<IMLOperatorTensor>>&& constant_tensors = {}
+) noexcept;
+
+// C API kernel compute function
+OrtStatus* ORT_API_CALL DmlAbiKernel_Compute(
+    OrtKernelImpl* this_ptr,
+    OrtKernelContext* context
+) noexcept;
+
+// C API kernel release function
+void ORT_API_CALL DmlAbiKernel_Release(OrtKernelImpl* this_ptr) noexcept;
+
+// Helper to get DmlAbiKernel from OrtKernelImpl
+inline DmlAbiKernel* GetDmlAbiKernelFromImpl(OrtKernelImpl* impl) {
+    return reinterpret_cast<DmlAbiKernel*>(
+        reinterpret_cast<char*>(impl) + sizeof(OrtKernelImpl)
+    );
+}
+
+
+#ifdef DML_PERF_PROFILE
+void DmlPerfWriteLogImpl(std::string_view msg) noexcept;
+
+inline std::string Hex(uint32_t v) { return fmt::format("0x{:08X}", v); }
+
+#define DML_PERF_LOG(...) ::dml_ep::DmlPerfWriteLogImpl(MakeString(__VA_ARGS__))
+
+void PrintKernelPerfCounters(const DmlAbiKernel& kernel) noexcept;
+#else
+#define DML_PERF_LOG(...)
+#endif
+
+}  // namespace dml_ep

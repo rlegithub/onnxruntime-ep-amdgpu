@@ -1,0 +1,486 @@
+// Copyright (c) Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
+#include <algorithm>
+
+#include "common/enumerate.h"
+#include "common/dynamic_library.h"
+
+#include "gpu_options.h"
+#include "gpu_ep.h"
+#include "gpu_factory.h"
+
+#include "onnxruntime_ep_device_ep_metadata_keys.h"
+
+#define BACKEND_CALL_T(backend, fn, defval, ...)                       \
+    do {                                                               \
+        return (backend != nullptr &&                                  \
+                backend->fn != nullptr) ?                              \
+                    backend->fn(backend, ##__VA_ARGS__) : defval;        \
+    } while (0)
+
+#define BACKEND_CALL_S(backend, fn, ...)                               \
+    do {                                                               \
+        if (backend != nullptr) {                                      \
+            if (backend->fn == nullptr) {                              \
+                return MAKE_STATUS(ORT_NOT_IMPLEMENTED, #fn ": method not implemented"); \
+            }                                                          \
+            RETURN_IF_ERROR(backend->fn(backend, ##__VA_ARGS__));        \
+            return STATUS_OK;                                          \
+        }                                                              \
+        return MAKE_STATUS(ORT_EP_FAIL, #fn ": invalid backend factory"); \
+    } while (0)
+
+#define BACKEND_CALL_V(backend, fn, ...)                               \
+    do {                                                               \
+        if (backend != nullptr && backend->fn != nullptr) {            \
+            backend->fn(backend, ##__VA_ARGS__);                         \
+        }                                                              \
+    } while (0)
+
+
+namespace gpu_ep {
+
+namespace {
+#ifdef USE_DML
+constexpr auto directmlBackend{LIBRARY_PREFIX ORT_TSTR("directx-backend") LIBRARY_SUFFIX};
+#endif
+constexpr auto migraphxBackend{LIBRARY_PREFIX ORT_TSTR("migraphx-backend") LIBRARY_SUFFIX};
+constexpr auto hipBackend{LIBRARY_PREFIX ORT_TSTR("hip-backend") LIBRARY_SUFFIX};
+}
+
+ProviderFactory::ProviderFactory(const ApiPtrs& api_ptrs, const OrtApiBase* ort_api_base, const char* ep_name, const OrtLogger* default_logger)
+    : OrtEpFactory{NegotiatedOrtApiVersion()}, ApiPtrs{api_ptrs}, default_logger_{default_logger}, ep_name_{ep_name}
+{
+    OrtEpFactory::GetName = [](const OrtEpFactory* this_) noexcept {
+        API_CALL_T(const ProviderFactory, this_, GetName, "invalid object pointer");
+    };
+    OrtEpFactory::GetVendor = [](const OrtEpFactory* this_) noexcept {
+        API_CALL_T(const ProviderFactory, this_, GetVendor, "invalid object pointer");
+    };
+    OrtEpFactory::GetSupportedDevices = [](OrtEpFactory* this_,
+            const OrtHardwareDevice* const* devices, size_t num_devices, OrtEpDevice** ep_devices,
+            size_t max_ep_devices, size_t* num_ep_devices) noexcept {
+        API_CALL_S(ProviderFactory, this_, GetSupportedDevices, {devices, devices + num_devices},
+            {ep_devices, ep_devices + max_ep_devices}, *num_ep_devices);
+    };
+    OrtEpFactory::CreateEp = [](OrtEpFactory* this_, const OrtHardwareDevice* const* devices,
+            const OrtKeyValuePairs* const* ep_metadata_pairs, size_t num_devices,
+            const OrtSessionOptions* session_options, const OrtLogger* logger, OrtEp** ep) noexcept
+    {
+        API_CALL_S(ProviderFactory, this_, CreateEp, {devices, devices + num_devices},
+            {ep_metadata_pairs, ep_metadata_pairs + num_devices},
+            Ort::ConstSessionOptions{session_options}, logger, *ep);
+    };
+    OrtEpFactory::ReleaseEp = [](OrtEpFactory* this_, OrtEp* ep) noexcept {
+        API_CALL_V(ProviderFactory, this_, ReleaseEp, ep);
+    };
+    OrtEpFactory::GetVendorId = [](const OrtEpFactory* this_) noexcept {
+        API_CALL_T(const ProviderFactory, this_, GetVendorId, static_cast<uint32_t>(-1));
+    };
+    OrtEpFactory::GetVersion = [](const OrtEpFactory* this_) noexcept {
+        API_CALL_T(const ProviderFactory, this_, GetVersion, "invalid object pointer");
+    };
+    // TODO: OrtEpFactory::ValidateCompiledModelCompatibilityInfo = []
+    OrtEpFactory::CreateAllocator = [](OrtEpFactory* this_, const OrtMemoryInfo* memory_info,
+            const OrtKeyValuePairs* allocator_options, OrtAllocator** allocator) noexcept {
+        API_CALL_S(ProviderFactory, this_, CreateAllocator, memory_info,
+            allocator_options, allocator);
+    };
+    OrtEpFactory::ReleaseAllocator = [](OrtEpFactory* this_, OrtAllocator* allocator) noexcept {
+        API_CALL_V(ProviderFactory, this_, ReleaseAllocator, allocator);
+    };
+    OrtEpFactory::CreateDataTransfer = [](OrtEpFactory* this_, OrtDataTransferImpl** data_transfer) noexcept {
+        API_CALL_S(ProviderFactory, this_, CreateDataTransfer, data_transfer);
+    };
+    OrtEpFactory::IsStreamAware = [](const OrtEpFactory* this_) noexcept {
+        API_CALL_T(const ProviderFactory, this_, IsStreamAware, false);
+    };
+    OrtEpFactory::CreateSyncStreamForDevice = [](OrtEpFactory* this_, const OrtMemoryDevice* memory_device,
+            const OrtKeyValuePairs* stream_options, OrtSyncStreamImpl** stream) noexcept {
+        API_CALL_S(ProviderFactory, this_, CreateSyncStreamForDevice, memory_device,
+            stream_options, stream);
+    };
+    OrtEpFactory::GetHardwareDeviceIncompatibilityDetails = [](OrtEpFactory* this_, const OrtHardwareDevice* hw,
+            OrtDeviceEpIncompatibilityDetails* details) noexcept {
+        API_CALL_S(ProviderFactory, this_, GetHardwareDeviceIncompatibilityDetails, hw, details);
+    };
+    OrtEpFactory::CreateExternalResourceImporterForDevice = [](OrtEpFactory* this_, const OrtEpDevice* ep_device,
+            OrtExternalResourceImporterImpl** out_importer) noexcept {
+        API_CALL_S(ProviderFactory, this_, CreateExternalResourceImporterForDevice,
+            ep_device, out_importer);
+    };
+    OrtEpFactory::GetNumCustomOpDomains = [](OrtEpFactory* this_, size_t* num_domains) noexcept {
+        API_CALL_S(ProviderFactory, this_, GetNumCustomOpDomains, num_domains);
+    };
+    OrtEpFactory::GetCustomOpDomains = [](OrtEpFactory* this_, OrtCustomOpDomain** domains,
+            const size_t num_domains) noexcept {
+        API_CALL_S(ProviderFactory, this_, GetCustomOpDomains, domains, num_domains);
+    };
+
+    size_t factories_created{};
+
+#ifdef USE_DML
+    THROW_IF_ERROR(LoadDynamicLibrary(directmlBackend, &dml_backend_));
+    THROW_IF_ERROR(GetSymbolFromLibrary(dml_backend_,
+        "ReleaseEpFactory", reinterpret_cast<void**>(&dml_release_ep_factory_)));
+
+    CreateEpFactories_t dml_create_ep_factories{};
+    THROW_IF_ERROR(GetSymbolFromLibrary(dml_backend_,
+        "CreateEpFactories", reinterpret_cast<void**>(&dml_create_ep_factories)));
+
+    // Optional: a backend may export a telemetry collector. Absence is fine.
+    if (!GetSymbolFromLibrary(dml_backend_, telemetry::kGetBackendDataSymbol,
+            reinterpret_cast<void**>(&dml_get_telemetry_)).IsOK()) {
+        dml_get_telemetry_ = nullptr;
+    }
+
+    // Pass ep_name_ (e.g. "amdgpu") so the directml backend registers its kernels,
+    // allocators, and node assignments under the same name ORT sees for this EP.
+    // Using kDirectMLBackend ("directml") would cause a provider name mismatch:
+    // ORT would look up kernels under "amdgpu" but find them stamped as "directml".
+    THROW_IF_ERROR(dml_create_ep_factories(ep_name_.c_str(), ort_api_base, default_logger,
+        &dml_ep_factory_, 1, &factories_created));
+    custom_op_backends_.push_back(dml_ep_factory_);
+#endif
+
+    THROW_IF_ERROR(LoadDynamicLibrary(migraphxBackend, &mgx_backend_));
+    THROW_IF_ERROR(GetSymbolFromLibrary(mgx_backend_,
+        "ReleaseEpFactory", reinterpret_cast<void**>(&mgx_release_ep_factory_)));
+
+    CreateEpFactories_t mgx_create_ep_factories{};
+    THROW_IF_ERROR(GetSymbolFromLibrary(mgx_backend_,
+        "CreateEpFactories", reinterpret_cast<void**>(&mgx_create_ep_factories)));
+
+    // Optional: a backend may export a telemetry collector. Absence is fine.
+    if (!GetSymbolFromLibrary(mgx_backend_, telemetry::kGetBackendDataSymbol,
+            reinterpret_cast<void**>(&mgx_get_telemetry_)).IsOK()) {
+        mgx_get_telemetry_ = nullptr;
+    }
+
+    THROW_IF_ERROR(mgx_create_ep_factories(kMIGraphXBackend, ort_api_base, default_logger,
+        &mgx_ep_factory_, 1, &factories_created));
+
+    // hip (morphizen) backend: optional, only present when built with USE_HIP.
+#ifdef USE_HIP
+    THROW_IF_ERROR(LoadDynamicLibrary(hipBackend, &hip_backend_));
+    THROW_IF_ERROR(GetSymbolFromLibrary(hip_backend_,
+        "ReleaseEpFactory", reinterpret_cast<void**>(&hip_release_ep_factory_)));
+
+    CreateEpFactories_t hip_create_ep_factories{};
+    THROW_IF_ERROR(GetSymbolFromLibrary(hip_backend_,
+        "CreateEpFactories", reinterpret_cast<void**>(&hip_create_ep_factories)));
+
+    THROW_IF_ERROR(hip_create_ep_factories(ep_name_.c_str(), ort_api_base, default_logger,
+        &hip_ep_factory_, 1, &factories_created));
+    custom_op_backends_.push_back(hip_ep_factory_);
+#endif
+}
+
+ProviderFactory::~ProviderFactory() {
+
+    telemetry_writer_.Stop();
+
+    // Destroy members that hold backend function pointers before unloading the DLLs.
+    // ~Allocator calls backend_ep_factory_->ReleaseAllocator and ~DataTransfer calls
+    // backend factory methods — both would crash if the DLL is already unloaded.
+    // Session-owned resources (DmlBucketizedBufferAllocator etc.) are already released
+    // by the time the factory is destroyed since sessions are destroyed first.
+    gpu_allocator_.reset();
+    pinned_allocator_.reset();
+
+    if (gpu_memory_info_) {
+        ort_api.ReleaseMemoryInfo(gpu_memory_info_);
+    }
+    if (pinned_memory_info_) {
+        ort_api.ReleaseMemoryInfo(pinned_memory_info_);
+    }
+#ifdef USE_DML
+    if (dml_ep_factory_ != nullptr && dml_release_ep_factory_ != nullptr) {
+        if (OrtStatus* status = dml_release_ep_factory_(dml_ep_factory_)) {
+            ort_api.ReleaseStatus(status);
+        }
+        dml_ep_factory_ = nullptr;
+    }
+    if (!UnloadDynamicLibrary(dml_backend_).IsOK()) {
+        /* TODO: log failure while unloading DirectML EP library */
+    }
+#endif
+    if (mgx_ep_factory_ != nullptr && mgx_release_ep_factory_ != nullptr) {
+        if (OrtStatus* status = mgx_release_ep_factory_(mgx_ep_factory_)) {
+            ort_api.ReleaseStatus(status);
+        }
+        mgx_ep_factory_ = nullptr;
+    }
+    if (!UnloadDynamicLibrary(mgx_backend_).IsOK()) {
+        /* TODO: log failure while unloading MIGraphX EP library */
+    }
+    if (hip_ep_factory_ != nullptr && hip_release_ep_factory_ != nullptr) {
+        if (OrtStatus* status = hip_release_ep_factory_(hip_ep_factory_)) {
+            ort_api.ReleaseStatus(status);
+        }
+        hip_ep_factory_ = nullptr;
+    }
+    if (!UnloadDynamicLibrary(hip_backend_).IsOK()) {
+        /* TODO: log failure while unloading hip EP library */
+    }
+}
+
+const char* ProviderFactory::GetName() const {
+    return ep_name_.c_str();
+}
+
+const char* ProviderFactory::GetVendor() const {
+    return amd::Vendor;
+}
+
+Ort::Status ProviderFactory::GetSupportedDevices(const std::vector<Ort::ConstHardwareDevice>& devices,
+    const gsl::span<OrtEpDevice*>& ep_devices, size_t& num_ep_devices) noexcept
+{
+    num_ep_devices = 0;
+    for(const auto& [i, device] : enumerate(devices)) {
+        if (num_ep_devices >= ep_devices.size()) {
+            break;
+        }
+        if (device.VendorId() == amd::VendorId && device.Type() == OrtHardwareDeviceType_GPU) {
+            Ort::EpDevice ep_device{*this, const_cast<Ort::ConstHardwareDevice&>(device)};
+
+            Ort::ConstKeyValuePairs metadata = ep_device.Device().Metadata();
+
+            // Use DxgiAdapterNumber from device metadata as the device_id when available,
+            // so the memory info device matches what DX12 uses to identify the adapter.
+            int device_index = i;
+            std::vector<const char*> keys, values;
+            metadata.GetKeyValuePairs(keys, values);
+            for (size_t idx = 0; idx < keys.size(); ++idx) {
+                if (strcmp(keys[idx], "DxgiAdapterNumber") == 0) {
+                    device_index = std::atoi(values[idx]);
+                }
+            }
+
+            // amdgpu-ep owns these memory info objects for the factory lifetime.
+            // The Allocator wrapper's Info() returns gpu_memory_info_, ensuring that
+            // ORT's plan locations and allocator map keys resolve to the same OrtDevice.
+            // Note: gpu_memory_info_ and pinned_memory_info_ are overwritten on each
+            // iteration, so only the last matched device is retained. This is acceptable
+            // for the common single-GPU case; multi-GPU support would require a per-device map.
+            RETURN_IF_ERROR(ort_api.CreateMemoryInfo_V2("default", OrtMemoryInfoDeviceType_GPU,
+                amd::VendorId, device_index, OrtDeviceMemoryType_DEFAULT, 0, OrtDeviceAllocator, &gpu_memory_info_));
+            RETURN_IF_ERROR(ep_api.EpDevice_AddAllocatorInfo(ep_device, gpu_memory_info_));
+            RETURN_IF_ERROR(ort_api.CreateMemoryInfo_V2("pinned", OrtMemoryInfoDeviceType_GPU,
+                amd::VendorId, device_index, OrtDeviceMemoryType_HOST_ACCESSIBLE, 0, OrtDeviceAllocator, &pinned_memory_info_));
+            RETURN_IF_ERROR(ep_api.EpDevice_AddAllocatorInfo(ep_device, pinned_memory_info_));
+            ep_devices[num_ep_devices++] = ep_device.release();
+        }
+    }
+    return STATUS_OK;
+}
+
+Ort::Status ProviderFactory::CreateEp(gsl::span<const OrtHardwareDevice* const> devices,
+    gsl::span<const OrtKeyValuePairs* const> /* ep_metadata */,
+    const Ort::ConstSessionOptions& session_options, const OrtLogger* logger, OrtEp* &ep)
+try {
+    ep = nullptr;
+    if (devices.size() > 1) {
+        return MAKE_STATUS(ORT_INVALID_ARGUMENT, "only supports selection for a single device");
+    }
+
+    ep = std::make_unique<ExecutionProvider>(*this, ep_name_, session_options, logger).release();
+    return STATUS_OK;
+} catch (const Ort::Exception& e) {
+    return Ort::Status{e};
+} catch (const std::exception& e) {
+    return Ort::Status{e.what(), ORT_EP_FAIL};
+}
+
+void ProviderFactory::ReleaseEp(OrtEp* ep) const {
+    delete reinterpret_cast<ExecutionProvider*>(ep);
+}
+
+uint32_t ProviderFactory::GetVendorId() const {
+    return amd::VendorId;
+}
+
+const char* ProviderFactory::GetVersion() const {
+    return version_.data();
+}
+
+Ort::Status ProviderFactory::CreateAllocator(const OrtMemoryInfo* memory_info,
+    const OrtKeyValuePairs* allocator_options, OrtAllocator** allocator)
+{
+    // The Allocator wrapper owns the amdgpu-ep memory info and lazily delegates
+    // actual allocation to whichever backend is currently selected. Its Info()
+    // returns the amdgpu-owned memory_info_ pointer, so ORT's allocator map key
+    // resolves to the same OrtDevice as the plan location.
+    //
+    // One wrapper per device memory type: ORT registers a separate shared
+    // allocator for the default and host-accessible memory infos and unregisters
+    // them by the device each allocator's Info() reports. Returning a single
+    // wrapper for both would report only the default device, leaving the pinned
+    // shared allocator unmatched at unload -> use-after-free on this factory
+    // during teardown. Both wrappers still delegate to the selected backend, so
+    // backend virtualization / dynamic switching is unaffected.
+    const auto mem_type = Ort::ConstMemoryInfo{memory_info}.GetDeviceMemoryType();
+    std::unique_ptr<Allocator>* slot = nullptr;
+    if (mem_type == OrtDeviceMemoryType_DEFAULT) {
+        slot = &gpu_allocator_;
+    } else if (mem_type == OrtDeviceMemoryType_HOST_ACCESSIBLE) {
+        slot = &pinned_allocator_;
+    } else {
+        return MAKE_STATUS(ORT_INVALID_ARGUMENT, "unsupported device memory type");
+    }
+
+    if (*slot == nullptr) {
+        *slot = std::make_unique<Allocator>(*this, memory_info, allocator_options);
+    }
+    *allocator = slot->get();
+    return STATUS_OK;
+}
+
+void ProviderFactory::ReleaseAllocator(OrtAllocator*) const {
+    // no-op — the allocators are owned by the factory (gpu_allocator_ /
+    // pinned_allocator_) and shared across sessions.
+}
+
+Ort::Status ProviderFactory::CreateDataTransfer(OrtDataTransferImpl** data_transfer) {
+    // Called once per session (after that session's CreateEp) and once per factory at
+    // library-registration time, before any backend exists. DataTransfer's constructor
+    // tells the two apart and freezes or stays lazy accordingly — see its header.
+    // ORT owns each instance and calls Release (which deletes it) at teardown.
+    *data_transfer = std::make_unique<DataTransfer>(*this).release();
+    return STATUS_OK;
+}
+
+bool ProviderFactory::IsStreamAware() const {
+    BACKEND_CALL_T(backend_ep_factory_, IsStreamAware, false);
+}
+
+Ort::Status ProviderFactory::CreateSyncStreamForDevice(const OrtMemoryDevice* memory_device,
+    const OrtKeyValuePairs* stream_options, OrtSyncStreamImpl** stream) const
+{
+    BACKEND_CALL_S(backend_ep_factory_, CreateSyncStreamForDevice,
+        memory_device, stream_options, stream);
+}
+
+Ort::Status ProviderFactory::CreateExternalResourceImporterForDevice(const OrtEpDevice* ep_device,
+    OrtExternalResourceImporterImpl** out_importer) const
+{
+    BACKEND_CALL_S(backend_ep_factory_, CreateExternalResourceImporterForDevice,
+        ep_device, out_importer);
+}
+
+Ort::Status ProviderFactory::GetHardwareDeviceIncompatibilityDetails(const OrtHardwareDevice* device,
+    OrtDeviceEpIncompatibilityDetails* details) const
+{
+    BACKEND_CALL_S(backend_ep_factory_, GetHardwareDeviceIncompatibilityDetails,
+        device, details);
+}
+
+Ort::Status ProviderFactory::GetNumCustomOpDomains(size_t* num_domains) const {
+    // Forward to every backend factory that is loaded so ORT registers all custom
+    // op schemas any backend may claim during GetCapability. Which backend a given
+    // model actually uses is only decided later in CreateEp (profile option), but
+    // schema registration happens during Model::Load, before any session/EP exists
+    // -- so the union of every built backend's domains must be reported here
+    // regardless of the eventual profile selection.
+    *num_domains = 0;
+    for (OrtEpFactory* factory : custom_op_backends_) {
+        if (factory == nullptr || factory->GetNumCustomOpDomains == nullptr) {
+            continue;
+        }
+        size_t count{};
+        RETURN_IF_ERROR(factory->GetNumCustomOpDomains(factory, &count));
+        *num_domains += count;
+    }
+    return STATUS_OK;
+}
+
+Ort::Status ProviderFactory::GetCustomOpDomains(OrtCustomOpDomain** domains, size_t num_domains) const {
+    // Each backend fills its own slice of the caller's buffer, whose size ORT took
+    // from GetNumCustomOpDomains. Clamp to the space left so a backend reporting
+    // more domains here than it did there cannot overrun the buffer.
+    size_t offset = 0;
+    for (OrtEpFactory* factory : custom_op_backends_) {
+        if (factory == nullptr || factory->GetCustomOpDomains == nullptr ||
+                factory->GetNumCustomOpDomains == nullptr) {
+            continue;
+        }
+        size_t count{};
+        RETURN_IF_ERROR(factory->GetNumCustomOpDomains(factory, &count));
+        count = std::min(count, num_domains - offset);
+        if (count == 0) {
+            continue;
+        }
+        RETURN_IF_ERROR(factory->GetCustomOpDomains(factory, domains + offset, count));
+        offset += count;
+    }
+    return STATUS_OK;
+}
+
+}  // namespace gpu_ep
+
+extern "C" {
+
+OrtStatus* CreateEpFactories(const char* registration_name, const OrtApiBase* ort_api_base,
+    const OrtLogger* default_logger, OrtEpFactory** factories, size_t max_factories, size_t* num_factories)
+{
+    if (registration_name == nullptr || *registration_name == 0) {
+        RETURN_STATUS(ORT_INVALID_ARGUMENT, "invalid or empty registration name");
+    }
+    if (ort_api_base == nullptr) {
+        RETURN_STATUS(ORT_INVALID_ARGUMENT, "invalid base API pointer");
+    }
+    if (factories == nullptr || num_factories == nullptr || max_factories == 0) {
+        RETURN_STATUS(ORT_INVALID_ARGUMENT, "invalid factories return buffer or capacity too small");
+    }
+    try {
+#ifdef _WIN32
+        HMODULE module = nullptr;
+        if (GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                  GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              static_cast<LPCSTR>(static_cast<void*>(CreateEpFactories)),
+                              &module) != 0) {
+            std::vector<wchar_t> buffer;
+            for (;;) {
+                buffer.resize(buffer.size() + MAX_PATH);
+                if (const auto writen{GetModuleFileNameW(module, buffer.data(),
+                        static_cast<DWORD>(buffer.size()))}; writen < buffer.size()) {
+                    break;
+                }
+            }
+            fs::path path(buffer.begin(), buffer.end());
+            SetDllDirectoryW(path.parent_path().native().c_str());
+        }
+#endif
+        const OrtApi* ort_api{NegotiateOrtApi(*ort_api_base, kMinOrtApiVersion)};
+        if (ort_api == nullptr) {
+            RETURN_STATUS(ORT_EP_FAIL, "onnxruntime runtime too old: amdgpu-ep requires ORT API >= ",
+                kMinOrtApiVersion);
+        }
+        const OrtEpApi* ep_api{ort_api->GetEpApi()};
+        const OrtModelEditorApi* model_editor_api{ort_api->GetModelEditorApi()};
+
+        Ort::InitApi(ort_api);
+
+        *num_factories = 1;
+        *factories = std::make_unique<gpu_ep::ProviderFactory>(ApiPtrs{*ort_api, *ep_api, *model_editor_api},
+            ort_api_base, registration_name, default_logger).release();
+
+        return nullptr;
+    }
+    catch (const std::exception& e) {
+        RETURN_STATUS(ORT_EP_FAIL, e.what());
+    }
+}
+
+OrtStatus* ReleaseEpFactory(OrtEpFactory* factory) {
+    delete reinterpret_cast<gpu_ep::ProviderFactory*>(factory);
+    return nullptr;
+}
+
+}  // extern "C"

@@ -1,0 +1,1761 @@
+// Copyright (c) Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+#include <algorithm>
+#include <array>
+#include <charconv>
+#include <cstdio>
+#include <optional>
+#include <regex>
+#include <set>
+#include <string>
+#include <string_view>
+#include <unordered_set>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+#include <gsl/span>
+
+#include <migraphx/migraphx.hpp>
+#include <migraphx/version.h>
+
+#include "common/constants.h"
+#include "common/enumerate.h"
+#include "common/env_var.h"
+#include "common/murmurhash3.h"
+#include "common/ort_graph_to_proto.h"
+#include "common/telemetry.h"
+
+#include "hip/stream_support.h"
+
+#include "mgx_dynamic_batch.h"
+#include "mgx_ep.h"
+#include "mgx_ep_ctx.h"
+#include "mgx_hip_graph.h"
+#include "mgx_info.h"
+#include "mgx_precompile.h"
+#include "mgx_program_ops.h"
+#include "mgx_utils.h"
+
+namespace mgx_ep {
+
+const char* ExecutionProvider::GetName() const noexcept {
+    return ep_name_.c_str();
+}
+
+namespace {
+
+ONNXTensorElementDataType GetElementType(const Ort::ConstTypeInfo& type_info) {
+    switch (type_info.GetONNXType()) {
+    case ONNX_TYPE_TENSOR:
+    case ONNX_TYPE_SPARSETENSOR:
+        return type_info.GetTensorTypeAndShapeInfo().GetElementType();
+    case ONNX_TYPE_SEQUENCE:
+        return GetElementType(Ort::ConstTypeInfo{type_info.GetSequenceTypeInfo().GetSequenceElementType()});
+    case ONNX_TYPE_MAP:
+        return GetElementType(Ort::ConstTypeInfo{type_info.GetMapTypeInfo().GetMapValueType()});
+    case ONNX_TYPE_OPTIONAL:
+        return GetElementType(Ort::ConstTypeInfo{type_info.GetOptionalTypeInfo().GetOptionalElementType()});
+    case ONNX_TYPE_OPAQUE:
+    case ONNX_TYPE_UNKNOWN:
+        return ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+    }
+    THROW("invalid ONNX type");
+}
+
+bool IsTypeSupported(const Ort::ConstValueInfo& value_info) {
+    switch (GetElementType(value_info.TypeInfo())) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FNUZ:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2FNUZ:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT4:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool GetMIGraphXType(ONNXTensorElementDataType type, migraphx_shape_datatype_t& mgx_type) {
+    mgx_type = migraphx_shape_float_type;
+    switch (type) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+        mgx_type = migraphx_shape_half_type;
+        break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+        mgx_type = migraphx_shape_bf16_type;
+        break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+        mgx_type = migraphx_shape_float_type;
+        break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
+        mgx_type = migraphx_shape_double_type;
+        break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FNUZ:
+        mgx_type = migraphx_shape_fp8e4m3fnuz_type;
+        break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN:
+        mgx_type = migraphx_shape_fp8e4m3fn_type;
+        break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2:
+        mgx_type = migraphx_shape_fp8e5m2_type;
+        break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E5M2FNUZ:
+        mgx_type = migraphx_shape_fp8e5m2fnuz_type;
+        break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT4E2M1:
+        mgx_type = migraphx_shape_fp4x2_type;
+        break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:
+        mgx_type = migraphx_shape_int8_type;
+        break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16:
+        mgx_type = migraphx_shape_int16_type;
+        break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
+        mgx_type = migraphx_shape_int32_type;
+        break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
+        mgx_type = migraphx_shape_int64_type;
+        break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT4:
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:
+        mgx_type = migraphx_shape_uint8_type;
+        break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16:
+        mgx_type = migraphx_shape_uint16_type;
+        break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32:
+        mgx_type = migraphx_shape_uint32_type;
+        break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64:
+        mgx_type = migraphx_shape_uint64_type;
+        break;
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
+        mgx_type = migraphx_shape_bool_type;
+        break;
+    default:
+    /*    LOG(WARNING) << "unsupported data type " << type
+                     << ", fallback to CPU implementation"; */
+        return false;
+    }
+    return true;
+}
+
+bool IsUnsupportedOpMode(const Ort::ConstGraph& graph, const Ort::ConstNode& node) {
+    const auto op_type{node.GetOperatorType()};
+    const auto inputs{GetValueInfos(node.GetInputs())};
+    if (op_type == "ArgMax" || op_type == "ArgMin") {
+        // we do not support select_last_index = 1 for now
+        Ort::ConstOpAttr attr;
+        const Ort::Status status{node.GetAttributeByName("select_last_index", attr)};
+        if (status.IsOK() && attr) {
+            if (int64_t value; !attr.GetValue(value).IsOK() || value != 0) {
+                return true;
+            }
+        }
+    } else if (op_type == "ConstantOfShape") {
+        if (!CanEvalNodeArgument(graph, node, {0})) {
+            return true;
+        }
+    } else if (op_type == "ConvInteger") {
+        // only support int8 and uint8 type
+        if (inputs.empty()) {
+            return true;
+        }
+        for (const auto& input : inputs) {
+            if (!IsInt8Tensor(input) && !IsUint8Tensor(input)) {
+                return true;
+            }
+        }
+    } else if (op_type == "Expand") {
+        // only supports constant shape input values
+        if (!CanEvalNodeArgument(graph, node, {1})) {
+            return true;
+        }
+    } else if (op_type == "MaxPool") {
+        // MaxPool "indices" output is not currently supported
+        if (GetValueInfos(node.GetOutputs()).size() > 1) {
+            return true;
+        }
+        // ceil_mode and dilations attrs are not supported
+        Ort::ConstOpAttr attr;
+        Ort::Status status{node.GetAttributeByName("dilations", attr)};
+        if (status.IsOK() && attr) {
+            std::vector<int64_t> dilations;
+            if (!attr.GetValueArray(dilations).IsOK()) {
+                return true;
+            }
+            if (!ranges::all_of(dilations,
+                [](int64_t dilation) { return dilation == 1; })) {
+                return true;
+            }
+        }
+        // storage order 1 (column major format) is not supported
+        status = node.GetAttributeByName("storage_order", attr);
+        if (status.IsOK() && attr) {
+            if (int64_t value; !attr.GetValue(value).IsOK() || value != 0) {
+                return true;
+            }
+        }
+    } else if (op_type == "MatMulInteger") {
+        if (inputs.empty()) {
+            return true;
+        }
+        // only support int8 and uint8 type
+        for (const auto& input : inputs) {
+            if (!IsInt8Tensor(input) && !IsUint8Tensor(input)) {
+                return true;
+            }
+        }
+    } else if (op_type == "OneHot") {
+        if (!CanEvalNodeArgument(graph, node, {1})) {
+            return true;
+        }
+    } else if (op_type == "Pad") {
+        // if pad size is not constant, migraphx cannot support
+        if (inputs.size() >= 2) {
+            if (!CanEvalNodeArgument(graph, node, {1})) {
+                return true;
+            }
+        }
+        static const std::set<std::string_view> allowed_modes{
+            "constant", "reflect", "edge"
+        };
+        Ort::ConstOpAttr attr;
+        Ort::Status status{node.GetAttributeByName("mode", attr)};
+        if (status.IsOK() && attr) {
+            if (std::string mode; !attr.GetValue(mode).IsOK() || allowed_modes.count(mode) == 0) {
+                return true;
+            }
+        }
+    } else if (op_type == "Range") {
+        std::vector<std::size_t> v(inputs.size());
+        std::iota(v.begin(), v.end(), 0);
+        if (!CanEvalNodeArgument(graph, node, v)) {
+            return true;
+        }
+    } else if (op_type == "Reshape") {
+        if (inputs.size() == 2) {
+            if (CanEvalNodeArgument(graph, node, {1})) {
+                return false;
+            }
+        }
+    } else if (op_type == "Resize" || op_type == "Upsample") {
+        Ort::ConstOpAttr attr;
+        Ort::Status status{node.GetAttributeByName("coordinate_transformation_mode", attr)};
+        if (status.IsOK() && attr) {
+            if (std::string value; !attr.GetValue(value).IsOK() || value == "tf_crop_and_resize") {
+                return true;
+            }
+        }
+        status = node.GetAttributeByName("mode", attr);
+        if (status.IsOK() && attr) {
+            if (std::string value; !attr.GetValue(value).IsOK() || value == "cubic") {
+                return true;
+            }
+        }
+    } else if (op_type == "ReduceSum") {
+        if (inputs.size() == 2) {
+            return !CanEvalNodeArgument(graph, node, {1});
+        }
+    } else if (op_type == "Slice") {
+        std::vector<std::size_t> v(inputs.size());
+        std::iota(v.begin(), v.end(), 0);
+        v.erase(v.begin());
+        if (!CanEvalNodeArgument(graph, node, v)) {
+            return true;
+        }
+        Ort::ConstOpAttr s_attr;
+        Ort::Status s_status{node.GetAttributeByName("starts", s_attr)};
+        Ort::ConstOpAttr e_attr;
+        Ort::Status e_status{node.GetAttributeByName("ends", e_attr)};
+        if (s_status.IsOK() && s_attr &&e_status.IsOK() && e_attr) {
+            std::vector<int64_t> starts;
+            if (!s_attr.GetValueArray(starts).IsOK()) {
+                return true;
+            }
+            std::vector<int64_t> ends;
+            if (!e_attr.GetValueArray(ends).IsOK()) {
+                return true;
+            }
+            for (const auto& [s, e]: zip(starts, ends)) {
+                if (s > e) { return true; }
+            }
+        }
+    } else if (op_type == "Split") {
+        // cannot process input dim of 0 size
+        for (const auto& input : inputs) {
+            const auto shape{input.TypeInfo().GetTensorTypeAndShapeInfo().GetShape()};
+            if (!shape.empty() && shape == std::vector<int64_t>{0}) {
+                return true;
+            }
+        }
+        if (inputs.size() == 2) {
+            return !CanEvalNodeArgument(graph, node, {1});
+        }
+    } else if (op_type == "Tile") {
+        if (!CanEvalNodeArgument(graph, node, {1})) {
+            return true;
+        }
+    } else if (op_type == "TopK") {
+        if (!CanEvalNodeArgument(graph, node, {1})) {
+            return true;
+        }
+    } else if (op_type == "Unsqueeze" || op_type == "Squeeze") {
+        if (inputs.size() == 2) {
+            return !CanEvalNodeArgument(graph, node, {1});
+        }
+    }
+    // Op doesn't fall into known any of unsupported modes.
+    return false;
+}
+
+std::unordered_set<size_t> CollectCpuControlFlowBoundaryNodes(
+    const std::vector<Ort::ConstNode>& sorted_nodes)
+{
+    // If/Loop/Scan on CPU. Greater/Cast too so the bool condition is CPU-resident
+    std::unordered_set<size_t> boundary_nodes;
+    for (const auto& node : sorted_nodes) {
+        const auto op_type{node.GetOperatorType()};
+        if (op_type == "If" || op_type == "Loop" || op_type == "Scan" ||
+            op_type == "Greater" || op_type == "Cast") {
+            boundary_nodes.insert(node.GetId());
+        }
+    }
+    return boundary_nodes;
+}
+
+std::vector<std::vector<Ort::ConstNode>> GetPartitionedSubgraphs(const std::vector<Ort::ConstNode>& nodes,
+    const std::vector<Ort::ConstNode>& unsupported_nodes)
+{
+    std::vector<std::vector<Ort::ConstNode>> subgraphs;
+    auto begin{nodes.begin()};
+    for (const auto& unsupported_node : unsupported_nodes) {
+        auto it{std::find_if(begin, nodes.end(),
+            [&unsupported_node](const Ort::ConstNode& node) {
+                return node.GetId() == unsupported_node.GetId();
+            })};
+        std::vector<Ort::ConstNode> subgraph{begin, it};
+        if (!subgraph.empty()) {
+            subgraphs.emplace_back(subgraph);
+        }
+        begin = ++it;
+    }
+    std::vector<Ort::ConstNode> subgraph{begin, nodes.end()};
+    if (!subgraph.empty()) {
+        subgraphs.emplace_back(subgraph);
+    }
+    return subgraphs;
+}
+
+Map<size_t> BuildInputNameIndices(const Ort::ConstGraph& graph, const Ort::ConstNode& fused_node) {
+    Map<size_t> input_name_indices;
+    size_t input_index{};
+    const auto add_input = [&](const Ort::ConstValueInfo& input) {
+        if (input == nullptr || input.IsConstantInitializer()) {
+            return;
+        }
+        if (input_name_indices.count(input.GetName()) != 0) {
+            return;
+        }
+        input_name_indices.emplace(input.GetName(), input_index++);
+    };
+    // KernelContext indices: fused boundary inputs, then graph inputs (branch feeds).
+    for (const auto& input : GetValueInfos(fused_node.GetInputs())) {
+        add_input(input);
+    }
+    for (const auto& input : GetValueInfos(graph.GetInputs())) {
+        add_input(input);
+    }
+    for (const auto& input : GetValueInfos(fused_node.GetImplicitInputs())) {
+        add_input(input);
+    }
+    return input_name_indices;
+}
+
+void* GetGpuInputData(ComputeState& cs, const Ort::KernelContext& ctx, const std::string& name,
+    size_t index, const migraphx::shape& prog_shape, hipStream_t stream)
+{
+    const auto input_tensor{ctx.GetInput(index)};
+    const auto mem{input_tensor.GetTensorMemoryInfo()};
+    if (mem.GetDeviceType() != OrtMemoryInfoDeviceType_CPU) {
+        return const_cast<void*>(input_tensor.GetTensorRawData());
+    }
+
+    const std::size_t bytes{prog_shape.bytes()};
+    auto& buf{cs.cpu_input_upload_bufs[name]};
+    if (buf.data == nullptr || buf.size_bytes < bytes) {
+        if (buf.data != nullptr) {
+            (void)hipFree(buf.data);
+        }
+        void* ptr{nullptr};
+        HIP_CALL_THROW(hipMalloc(&ptr, bytes));
+        buf.data = ptr;
+        buf.size_bytes = bytes;
+        buf.shape = prog_shape;
+    }
+
+    const void* src{input_tensor.GetTensorRawData()};
+    if (bytes > 0) {
+        if (stream != nullptr) {
+            HIP_CALL_THROW(hipMemcpyAsync(buf.data, src, bytes, hipMemcpyHostToDevice, stream));
+        } else {
+            HIP_CALL_THROW(hipMemcpy(buf.data, src, bytes, hipMemcpyHostToDevice));
+        }
+    }
+    return buf.data;
+}
+
+}  // namespace
+
+#define PARSE_ENV_VAR(__name__, __value__)                                               \
+    const auto __value__##env{ParseEnvironmentVariable<decltype(__value__)>(__name__)};  \
+    if (__value__##env.has_value()) {                                                    \
+        __value__ = __value__##env.value();                                              \
+    }
+
+ExecutionProvider::ExecutionProvider(const ProviderFactory& factory, std::string_view ep_name, Ort::ConstSessionOptions session_options, const Ort::Logger& logger)
+    : OrtEp{NegotiatedOrtApiVersion()}, ApiPtrs{factory.ort_api, factory.ep_api, factory.model_editor_api}, factory_{factory}, logger_{logger}, ep_name_{ep_name}
+{
+    OrtEp::GetName = [](const OrtEp* this_) noexcept {
+        API_CALL_T(const ExecutionProvider, this_, GetName, "invalid object pointer");
+    };
+    OrtEp::GetCapability = [](OrtEp* this_, const OrtGraph* graph,
+                              OrtEpGraphSupportInfo* graph_support_info) noexcept {
+        API_CALL_S(ExecutionProvider, this_, GetCapability, Ort::ConstGraph{graph}, graph_support_info);
+    };
+    OrtEp::Compile = [](OrtEp* this_, const OrtGraph** graphs, const OrtNode** fused_nodes,
+                        size_t count, OrtNodeComputeInfo** node_compute_infos, OrtNode** ep_context_nodes) noexcept {
+        API_CALL_S(ExecutionProvider, this_, Compile, {graphs, graphs + count},
+                   {fused_nodes, fused_nodes + count}, {node_compute_infos, count}, {ep_context_nodes, count});
+    };
+    OrtEp::ReleaseNodeComputeInfos = [](OrtEp* this_, OrtNodeComputeInfo** node_compute_infos,
+                                        size_t num_node_compute_info) noexcept {
+        API_CALL_V(ExecutionProvider, this_, ReleaseNodeComputeInfos, {node_compute_infos, num_node_compute_info});
+    };
+    // OrtEp::SetDynamicOptions = [](OrtEp* this_, const char* const* option_keys, const char* const* option_values,
+    //         size_t num_options) noexcept {
+    //     API_CALL_S(ExecutionProvider, this_, SetDynamicOptions, option_keys, option_values, num_options);
+    // };
+    // OrtEp::OnRunStart = [](OrtEp* this_, const OrtRunOptions* run_options) noexcept {
+    //     API_CALL_S(ExecutionProvider, this_, OnRunStart, run_options);
+    // };
+    OrtEp::OnRunEnd = [](OrtEp* this_, const OrtRunOptions* run_options, bool sync_stream) noexcept {
+        API_CALL_S(ExecutionProvider, this_, OnRunEnd, run_options, sync_stream);
+    };
+    OrtEp::CreateSyncStreamForDevice = [](OrtEp* this_, const OrtMemoryDevice* memory_device,
+                                          OrtSyncStreamImpl** stream) noexcept {
+        API_CALL_S(ExecutionProvider, this_, CreateSyncStreamForDevice, memory_device, stream);
+    };
+    // OrtEp::GetCompiledModelCompatibilityInfo = [](OrtEp* this_, const OrtGraph* graph) noexcept {
+    //     API_CALL_T(ExecutionProvider, this_, GetCompiledModelCompatibilityInfo, "invalid object pointer", graph);
+    // };
+    OrtEp::GetKernelRegistry = [](OrtEp* this_, const OrtKernelRegistry** kernel_registry) noexcept {
+        API_CALL_S(ExecutionProvider, this_, GetKernelRegistry, kernel_registry);
+    };
+
+    std::string lowercase{ep_name_};
+    std::transform(lowercase.begin(), lowercase.end(), lowercase.begin(), ::tolower);
+
+    OrtKeyValuePairs* ort_key_value_pairs;
+    THROW_IF_ERROR(ort_api.GetSessionOptionsConfigEntries(session_options, &ort_key_value_pairs));
+
+    const Ort::KeyValuePairs key_value_pairs{ort_key_value_pairs};
+    const std::string ep_prefix{"ep." + lowercase + "."};
+
+    ProviderOptions provider_options;
+    for (const auto& [key, value] : key_value_pairs.GetKeyValuePairs()) {
+        if (key.rfind(ep_prefix, 0) == 0) {
+            provider_options.emplace(key.substr(ep_prefix.length()), value);
+        } else if (key.rfind("ep.directml.", 0) == 0) {
+            // Keys namespaced to the DirectML sibling backend (e.g. ep.directml.enable_host_accessible)
+            // are not ours. The umbrella forwards every ep.* entry to whichever backend it selects, so
+            // a DirectML-targeted key can reach the migraphx backend when the umbrella routes to migraphx
+            // (e.g. OGA's trivial init session, backend=Auto). Skip it — ProviderInfo would otherwise
+            // reject it as an unknown provider option and fail EP creation.
+            continue;
+        } else if (key.rfind("ep.", 0) == 0) {
+            provider_options.emplace(key, value);
+        }
+    }
+
+    const ProviderInfo info{provider_options};
+
+    device_id_ = info.device_id;
+    enable_fp16_ = info.enable_fp16;
+    enable_bf16_ = info.enable_bf16;
+    enable_fp8_ = info.enable_fp8;
+    enable_int8_ = info.enable_int8;
+    exhaustive_tune_ = info.exhaustive_tune;
+    mlss_use_specific_ops_ = info.mlss_use_specific_ops;
+    model_arch_ = info.model_arch;
+    cache_dir_ = info.cache_dir;
+    int8_use_native_calibration_table_ = info.int8_use_native_calibration_table;
+    int8_calibration_table_name_ = info.int8_calibration_table_name;
+    dump_subgraphs_ = info.dump_subgraphs;
+    compute_mode_ = info.compute_mode;
+    disable_compiled_model_caching_ = info.disable_caching;
+    force_recompile_ = info.force_recompile;
+    context_embed_mode_ = info.context_embed_mode;
+    context_enable_ = info.context_enable;
+    external_initializers_file_name_ = info.external_initializers_file_name;
+    context_file_path_ = info.context_file_path;
+    context_node_name_prefix_ = info.context_node_name_prefix;
+    hip_graph_enable_ = info.hip_graph_enable;
+    max_dynamic_batch_ = info.max_dynamic_batch;
+    compile_batches_ = info.compile_batches;
+    precompile_at_load_ = info.precompile_at_load;
+    coalesce_io_enable_ = info.coalesce_io;
+    cpu_control_flow_enable_ = info.cpu_control_flow;
+    static_pad_seq_ = info.static_pad_seq;
+    static_pad_seq_len_ = info.static_pad_seq_len;
+    static_pad_inputs_ = info.static_pad_inputs;
+    static_pad_outputs_ = info.static_pad_outputs;
+
+    HIP_CALL_THROW(hipSetDevice(device_id_));
+    HIP_CALL_THROW(hipGetDeviceProperties(&device_prop_, device_id_));
+
+    compute_capability_ = device_prop_.gcnArchName;
+
+    PARSE_ENV_VAR(env_var::kFP16Enable, enable_fp16_);
+    PARSE_ENV_VAR(env_var::kBF16Enable, enable_bf16_);
+    PARSE_ENV_VAR(env_var::kFP8Enable, enable_fp8_);
+    PARSE_ENV_VAR(env_var::kINT8Enable, enable_int8_);
+    PARSE_ENV_VAR(env_var::kDisableCompiledModelCaching, disable_compiled_model_caching_);
+    PARSE_ENV_VAR(env_var::kForceRecompile, force_recompile_);
+    PARSE_ENV_VAR(env_var::kINT8CalibrationTableName, int8_calibration_table_name_);
+    PARSE_ENV_VAR(env_var::kINT8UseNativeCalibrationTable, int8_use_native_calibration_table_);
+    PARSE_ENV_VAR(env_var::kCacheDir, cache_dir_);
+    PARSE_ENV_VAR(env_var::kDumpSubgraphs, dump_subgraphs_);
+    PARSE_ENV_VAR(env_var::kDumpEpContextModel, context_enable_);
+    PARSE_ENV_VAR(env_var::kExhaustiveTune, exhaustive_tune_);
+    PARSE_ENV_VAR(env_var::kHipGraphEnable, hip_graph_enable_);
+    PARSE_ENV_VAR(env_var::kMaxDynamicBatch, max_dynamic_batch_);
+    PARSE_ENV_VAR(env_var::kCompileBatches, compile_batches_);
+    PARSE_ENV_VAR(env_var::kPrecompileAtLoad, precompile_at_load_);
+    PARSE_ENV_VAR(env_var::kCoalesceIO, coalesce_io_enable_);
+    PARSE_ENV_VAR(env_var::kStaticPadSeq, static_pad_seq_);
+    // Not PARSE_ENV_VAR: we need to know whether the value was given, not just what it is.
+    if (const auto pad_len_env{ParseEnvironmentVariable<std::size_t>(env_var::kStaticPadSeqLen)};
+        pad_len_env.has_value()) {
+        static_pad_seq_len_ = pad_len_env.value();
+        static_pad_seq_len_from_env_ = true;
+    }
+    PARSE_ENV_VAR(env_var::kStaticPadInputs, static_pad_inputs_);
+    PARSE_ENV_VAR(env_var::kStaticPadOutputs, static_pad_outputs_);
+    PARSE_ENV_VAR(env_var::kMlssUseSpecificOps, mlss_use_specific_ops_);
+    PARSE_ENV_VAR(env_var::kCpuControlFlow, cpu_control_flow_enable_);
+    PARSE_ENV_VAR(env_var::kModelArch, model_arch_);
+
+    // Per-architecture ops to force onto AMDMLSS.
+    // Add a row here to enable specific ops on additional architectures.
+    struct arch_mlss_ops {
+        std::string_view arch;
+        std::string_view ops;  // comma-separated op names
+    };
+    static constexpr std::array<arch_mlss_ops, 2> kArchMlssOps{{
+        {"gfx1200", "conv"},
+        {"gfx1201", "conv"},
+    }};
+
+    for (const auto& [arch, ops] : kArchMlssOps) {
+        if (compute_capability_.rfind(arch, 0) == 0) {
+            if (!mlss_use_specific_ops_.empty()) {
+                mlss_use_specific_ops_ += ",";
+            }
+            mlss_use_specific_ops_ += ops;
+        }
+    }
+
+    // Runs after compute_mode_ is taken from the provider options above, so the
+    // environment variable wins over the provider option.
+    if (const auto compute_mode_env{platform::GetEnvironmentVar(env_var::kComputeMode)};
+        !compute_mode_env.empty()) {
+        if (const auto parsed{ParseComputeMode(compute_mode_env)}; parsed.has_value()) {
+            compute_mode_ = *parsed;
+        } else {
+            ORT_CXX_LOG_NOEXCEPT(logger_, ORT_LOGGING_LEVEL_WARNING,
+                MakeString("Ignoring ", env_var::kComputeMode, "='", compute_mode_env,
+                    "': unknown compute mode, expected eager|balanced|maximum. "
+                    "Leaving the compute mode unchanged.").c_str());
+        }
+    }
+
+    if (cpu_control_flow_enable_ && hip_graph_enable_) {
+        hip_graph_enable_ = false;
+    }
+
+    if (enable_fp16_ && enable_bf16_) {
+        enable_fp16_ = enable_bf16_ = false;
+        /* TODO: log fp16 and bf16 are mutually exclusive - ignore both flags. */
+    }
+
+    if (enable_fp8_ && enable_int8_) {
+        enable_fp8_ = enable_int8_ = false;
+        /* TODO: log fp8 and int8 are mutually exclusive - ignore both flags. */
+    }
+
+    // hipGraph capture requires single-stream MIGraphX execution and a capturable
+    // (non-default, non-tracing) stream.  Disable it when the environment forces
+    // configurations that are incompatible with capture.
+    if (hip_graph_enable_) {
+        const auto nstreams{ParseEnvironmentVariableWithDefault<int>("MIGRAPHX_NSTREAMS", 1)};
+        const auto trace_eval{ParseEnvironmentVariableWithDefault<int>("MIGRAPHX_TRACE_EVAL", 0)};
+        const auto null_stream{ParseEnvironmentVariableWithDefault<int>("MIGRAPHX_ENABLE_NULL_STREAM", 0)};
+        if (nstreams > 1 || trace_eval != 0 || null_stream != 0) {
+            // MIGRAPHX_NSTREAMS>1: multi-stream execution cannot be captured.
+            // MIGRAPHX_TRACE_EVAL: inserts per-instruction hipStreamSynchronize.
+            // MIGRAPHX_ENABLE_NULL_STREAM: default stream is illegal during capture.
+            hip_graph_enable_ = false;
+            /* TODO: log that hipGraph was disabled due to incompatible MIGraphX env. */
+        }
+    }
+
+    // Coalesced input H2D rides on the staging path, which only runs when hipGraph
+    // (or dynamic batching) is active.  Without one of those the flag has no effect.
+    if (coalesce_io_enable_ && !hip_graph_enable_ && max_dynamic_batch_ == 0) {
+        /* TODO: log warning that ORT_MIGRAPHX_COALESCE_IO requires hipGraph or
+           dynamic batching (the staging path) to take effect. */
+    }
+
+    // If compile_batches is set, derive max_dynamic_batch from the spec's max value.
+    if (!compile_batches_.empty()) {
+        if (const auto explicit_sizes{ParseCompileBatches(compile_batches_)}; !explicit_sizes.empty()) {
+            if (const auto derived_max{explicit_sizes.back()}; max_dynamic_batch_ < derived_max) {
+                max_dynamic_batch_ = derived_max;
+            }
+        }
+    }
+
+    int8_calibration_cache_available_ =
+        (enable_int8_ || enable_fp8_) && !int8_calibration_table_name_.empty();
+
+    if (int8_calibration_cache_available_)
+        try {
+            if (const auto int8_calibration_cache_path{cache_dir_ / int8_calibration_table_name_};
+                !ReadDynamicRange(int8_calibration_cache_path, int8_use_native_calibration_table_, dynamic_ranges_)) {
+                throw std::runtime_error{"failed to read INT8 calibration table"};
+            }
+        }
+        catch (const std::exception& e) {
+            enable_int8_ = false;
+            /* TODO: log error reading calibration table */
+        }
+
+    /* TODO: print configured options for the session */
+
+    // Discover the read-only problem cache; paths are delivered to MIGraphX via the compile API.
+    setup_problem_cache_paths();
+
+    // Register only after construction succeeds so the factory count is balanced
+    // by the destructor.
+    if (cpu_control_flow_enable_) {
+        factory_.EnableCpuControlFlow();
+    }
+}
+
+#ifdef _WIN32
+// Directory of this EP module (independent of the host process's exe or cwd).
+static std::optional<fs::path> get_current_module_dir() {
+    static const char kAnchor{'\0'};  // address anchor in this module for GetModuleHandleEx
+    HMODULE module{nullptr};
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           &kAnchor, &module) == 0) {
+        return std::nullopt;
+    }
+
+    // GetModuleFileNameW never reports how much room it needs: on overflow it fills the
+    // buffer, truncates, sets ERROR_INSUFFICIENT_BUFFER and returns nSize itself. So the
+    // only way to detect success is a return strictly less than the buffer size, and the
+    // only way to recover is to grow (by MAX_PATH) and retry. MAX_PATH is just the first
+    // guess; long paths run to ~32767 wchars, which max_resizes bounds so a module whose
+    // path never fits cannot spin forever.
+    constexpr int max_resizes{16};
+    int current_resize{0};
+    HRESULT result{E_FAIL};
+    std::vector<wchar_t> buffer;
+    while ((current_resize < max_resizes) && (result != S_OK)) {
+        buffer.resize(buffer.size() + MAX_PATH);
+        const auto written{GetModuleFileNameW(module, buffer.data(), static_cast<DWORD>(buffer.size()))};
+        if (written == 0) {
+            return std::nullopt;  // genuine failure; a bigger buffer cannot help
+        }
+        result = (written < buffer.size()) ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+        ++current_resize;
+    }
+    if (result != S_OK) {
+        return std::nullopt;
+    }
+    return fs::path{buffer.data()}.parent_path();
+}
+#endif
+
+// JSON-escape backslashes and double-quotes so a file path survives the relaxed-JSON
+// backend-options parser as a quoted string.
+static std::string json_escape(const std::string& s) {
+    static const std::regex escape_chars{R"([\\"])"};
+    return std::regex_replace(s, escape_chars, R"(\$&)");  // $& = the matched backslash or quote
+}
+
+void ExecutionProvider::setup_problem_cache_paths() {
+    // Ordered read-only search list (highest priority first), delivered to MIGraphX via the
+    // compile API (set_advance_backend_option), not the MIGRAPHX_PROBLEM_CACHE env var. Paths
+    // are JSON-escaped once here so the delivery builder can drop them straight into the JSON.
+    problem_cache_paths_.clear();
+
+    // 1. App-provided override (ORT_MIGRAPHX_PROBLEM_CACHE), if set.
+    if (auto ep_override{platform::GetEnvironmentVar(env_var::kProblemCachePath)}; !ep_override.empty()) {
+        problem_cache_paths_.push_back(json_escape(ep_override));
+    }
+
+#ifdef _WIN32
+    // 2. Read-only problem_cache.json shipped in this EP module's own install directory
+    //    (deployed there by the MIGRAPHX_EP_PROBLEM_CACHE CMake option).
+    if (const auto module_dir{get_current_module_dir()}) {
+        const fs::path cache_path{*module_dir / "problem_cache.json"};
+        if (fs::exists(cache_path)) {
+            problem_cache_paths_.push_back(json_escape(cache_path.string()));
+        }
+    }
+#endif
+}
+
+ExecutionProvider::~ExecutionProvider() {
+    // Best-effort teardown of EP-owned device memory and captured graphs.  Errors
+    // are ignored because the HIP context may already be torn down at process exit.
+    (void)hipSetDevice(device_id_);
+    for (auto& [name, cs] : compute_states_) {
+        for (auto& [hash, entry] : cs.hip_graph_cache) {
+            if (entry.exec != nullptr) {
+                (void)hipGraphExecDestroy(entry.exec);
+                entry.exec = nullptr;
+            }
+            if (entry.graph != nullptr) {
+                (void)hipGraphDestroy(entry.graph);
+                entry.graph = nullptr;
+            }
+            entry.captured = false;
+        }
+        for (auto& [param_name, buf] : cs.staging_inputs) {
+            // Arena sub-views are not independent allocations; the arena is freed below.
+            if (buf.data != nullptr && !buf.is_arena_view) {
+                (void)hipFree(buf.data);
+            }
+            buf.data = nullptr;
+        }
+        if (cs.in_arena_dev != nullptr) {
+            (void)hipFree(cs.in_arena_dev);
+            cs.in_arena_dev = nullptr;
+        }
+        if (cs.in_staging_host != nullptr) {
+            (void)hipHostFree(cs.in_staging_host);
+            cs.in_staging_host = nullptr;
+        }
+        for (auto& [param_name, buf] : cs.staging_outputs) {
+            if (buf.data != nullptr) {
+                (void)hipFree(buf.data);
+                buf.data = nullptr;
+            }
+        }
+        for (auto& [hash, buf] : cs.scratch_bufs) {
+            if (buf.data != nullptr) {
+                (void)hipFree(buf.data);
+                buf.data = nullptr;
+            }
+        }
+        for (auto& [param_name, buf] : cs.cpu_input_upload_bufs) {
+            if (buf.data != nullptr) {
+                (void)hipFree(buf.data);
+                buf.data = nullptr;
+            }
+        }
+    }
+
+    if (cpu_control_flow_enable_) {
+        factory_.DisableCpuControlFlow();
+    }
+}
+
+Ort::Status ExecutionProvider::GetCapability(const Ort::ConstGraph& graph,
+                                             OrtEpGraphSupportInfo* graph_support_info) const noexcept
+try {
+    if (graph.GetNodes().empty()) {
+        return STATUS_OK;
+    }
+
+    // With cpu_control_flow, compile If/Loop/Scan branch bodies; ops in
+    // CollectCpuControlFlowBoundaryNodes stay on CPU.
+    const auto parent_node = graph.GetParentNode();
+    const bool in_control_flow_subgraph = parent_node &&
+        (parent_node.GetOperatorType() == "If" ||
+         parent_node.GetOperatorType() == "Loop" ||
+         parent_node.GetOperatorType() == "Scan");
+
+    if (!cpu_control_flow_enable_ && in_control_flow_subgraph) {
+        return STATUS_OK;
+    }
+
+    // Check if this graph contains EPContext nodes intended for this EP.
+    if (EpContextNodeReader::GraphHasContextNode(graph)) {
+        std::vector<Ort::ConstNode> ep_context_nodes;
+        for (const auto& node : graph.GetNodes()) {
+            if (node.GetOperatorType() != "EPContext") {
+                continue;
+            }
+            Ort::ConstOpAttr source_attr;
+            Ort::Status status{node.GetAttributeByName("source", source_attr)};
+            if (status.IsOK() && source_attr) {
+                std::string source;
+                if (source_attr.GetValue(source).IsOK() && source != kEpContextSource) {
+                    continue;
+                }
+            }
+            ep_context_nodes.push_back(node);
+        }
+        if (!ep_context_nodes.empty()) {
+            // EPContext nodes must be fused (not added as single nodes) so that
+            // ORT routes them through Compile() instead of looking for a kernel
+            OrtNodeFusionOptions node_fusion_options{NegotiatedOrtApiVersion(), true};
+            RETURN_IF_STATUS(ep_api.EpGraphSupportInfo_AddNodesToFuse(graph_support_info,
+                reinterpret_cast<const OrtNode* const*>(ep_context_nodes.data()),
+                ep_context_nodes.size(), &node_fusion_options));
+            return STATUS_OK;
+        }
+    }
+
+    static const auto supported_op_types{
+        []() -> std::set<std::string> {
+            const auto v{migraphx::get_onnx_operators()}; return {v.begin(), v.end()};
+        }()
+    };
+    std::vector<Ort::ConstNode> supported_nodes, unsupported_nodes;
+
+    const auto sorted_nodes{GetKahnsVariantTopologicalSortedNodes(graph)};
+    const std::unordered_set<size_t> cpu_boundary_nodes{
+        cpu_control_flow_enable_ && !in_control_flow_subgraph
+            ? CollectCpuControlFlowBoundaryNodes(sorted_nodes)
+            : std::unordered_set<size_t>{}};
+
+    for (const auto& node : sorted_nodes) {
+        if (cpu_control_flow_enable_ && !in_control_flow_subgraph &&
+            cpu_boundary_nodes.count(node.GetId()) != 0) {
+            unsupported_nodes.push_back(node);
+            continue;
+        }
+
+        bool are_types_supported{true};
+        for (const auto& output : GetValueInfos(node.GetOutputs())) {
+            are_types_supported &= IsTypeSupported(output);
+        }
+        for (const auto& input : GetValueInfos(node.GetInputs())) {
+            are_types_supported &= IsTypeSupported(input);
+        }
+
+        if (!are_types_supported || supported_op_types.count(node.GetOperatorType()) == 0 ||
+            (node.GetDomain() == kOnnxDomain && IsUnsupportedOpMode(graph, node)))
+        {
+            const auto op_type{node.GetOperatorType()};
+            unsupported_nodes.push_back(node);
+            continue;
+        }
+        supported_nodes.emplace_back(node);
+    }
+    if (unsupported_nodes.empty()) {
+        OrtNodeFusionOptions node_fusion_options{NegotiatedOrtApiVersion(), true};
+        RETURN_IF_STATUS(ep_api.EpGraphSupportInfo_AddNodesToFuse(graph_support_info,
+            reinterpret_cast<const OrtNode* const*>(supported_nodes.data()), supported_nodes.size(),
+            &node_fusion_options));
+    } else {
+        const auto subgraphs{GetPartitionedSubgraphs(sorted_nodes, unsupported_nodes)};
+        /* TODO: log unsupported nodes */
+        for (const auto& subgraph : subgraphs) {
+            OrtNodeFusionOptions node_fusion_options{NegotiatedOrtApiVersion(), true};
+            RETURN_IF_STATUS(ep_api.EpGraphSupportInfo_AddNodesToFuse(graph_support_info,
+                reinterpret_cast<const OrtNode* const*>(subgraph.data()), subgraph.size(),
+                &node_fusion_options));
+        }
+    }
+    return STATUS_OK;
+} catch (const Ort::Exception& e) {
+    return Ort::Status{e};
+} catch (const std::exception& e) {
+    return Ort::Status{e.what(), ORT_EP_FAIL};
+}
+
+namespace {
+
+constexpr std::uint64_t MIGraphX_Version =
+    (MIGRAPHX_VERSION_MAJOR << 16) | (MIGRAPHX_VERSION_MINOR << 8) | MIGRAPHX_VERSION_PATCH;
+
+bool get_input_output_names(const Ort::Graph& graph, std::vector<std::string>& input_names, std::vector<std::string>& output_names) {
+    output_names.clear();
+    ranges::for_each(graph.GetOutputs(),
+        [&](const auto& output) {
+            if (output != nullptr) {
+                if (const auto name{output.GetName()}; !name.empty()) {
+                    output_names.emplace_back(name);
+                }
+            }
+        });
+    const auto inputs{graph.GetInputs()};
+    input_names.clear();
+    if (inputs.empty()) {
+        return false;
+    }
+    ranges::for_each(inputs,
+        [&](const auto& input) {
+            if (input != nullptr) {
+                input_names.emplace_back(input.GetName());
+            }
+        });
+    return ranges::all_of(inputs,
+        [](const auto& input) {
+            if (input == nullptr) {
+                return true;
+            }
+            const auto shape{input.TypeInfo().GetTensorTypeAndShapeInfo().GetShape()};
+            if (shape.empty()) {
+                return false;
+            }
+            return ranges::all_of(shape,
+                [](const auto& dim) {
+                    return dim != -1;
+                });
+        });
+}
+
+}  // namespace
+
+void ExecutionProvider::CollectTelemetry(telemetry::BackendData& out) const noexcept {
+    out = backend_telemetry_;
+}
+
+Ort::Status ExecutionProvider::CreateNodeComputeInfoFromGraph(const Ort::ConstGraph& graph,
+    const Ort::ConstNode& fused_node, const Map<size_t>& input_name_indices, const Map<size_t>& output_name_indices,
+    const std::string& mxr_prefix, OrtNodeComputeInfo*& node_compute_info, OrtNode*& ep_context_node)
+{
+    bool loaded_from_cache = false;
+    const auto sorted_nodes{GetKahnsVariantTopologicalSortedNodes(graph)};
+    Ort::Graph sorted_graph{graph.GetGraphView(sorted_nodes)};
+    ONNX_NAMESPACE::ModelProto model_proto{};
+    RETURN_IF_ERROR(GraphToProto(sorted_graph, model_proto));
+    std::string onnx_string;
+    if (!model_proto.SerializeToString(&onnx_string) || onnx_string.empty()) {
+        return Ort::Status{"Serializing a model proto to string failed!", ORT_EP_FAIL};
+    }
+
+    auto subgraph_name{fused_node.GetName()};
+    if (dump_subgraphs_) {
+        std::ofstream ofs{subgraph_name + ".onnx", std::ios::binary | std::ios::trunc};
+        std::ignore = model_proto.SerializeToOstream(&ofs);
+    }
+
+    std::vector<std::string> input_names, output_names;
+    const auto has_input_shape{get_input_output_names(sorted_graph, input_names, output_names)};
+    fs::path model_path{graph.GetModelPath()};
+
+    // If context_enable is set but cache_dir isn't, default to context_file_path's or the
+    // model's directory so the EPContext node references an MXR file that actually gets written.
+    fs::path effective_cache_dir{cache_dir_};
+    if (context_enable_ && effective_cache_dir.empty()) {
+        if (!context_file_path_.empty()) {
+            effective_cache_dir = context_file_path_.parent_path();
+        } else if (!model_path.empty()) {
+            effective_cache_dir = model_path.parent_path();
+        }
+    }
+
+    RETURN_IF(context_enable_ && !has_input_shape,
+        "ep.context_enable is set but the graph has dynamic input shapes at compile time; "
+        "EPContext currently supports one statically compiled MXR per partition and cannot be "
+        "used with dynamic batching. Provide static input shapes before session creation. To use "
+        "dynamic batching instead, disable ep.context_enable and configure "
+        "ORT_MIGRAPHX_MAX_DYNAMIC_BATCH and, optionally, ORT_MIGRAPHX_COMPILE_BATCHES.");
+
+    migraphx::program program;
+    migraphx::onnx_options onnx_options;
+
+    const PrecompilePlan pre_plan = (!static_pad_seq_ && !context_enable_) ?
+        BuildPrecompilePlan(graph, fused_node, input_name_indices, max_dynamic_batch_, compile_batches_) :
+        PrecompilePlan{false, false, {}, {}};
+    const auto& [pre_eligible, pre_bucketed, pre_batch_sizes, pre_shapes_by_name] = pre_plan;
+    const bool use_plan_cache{pre_eligible && !effective_cache_dir.empty()};
+
+    std::string input_shapes_hash_hex;
+    if (has_input_shape) {
+        hash::Value input_shapes_hash{};
+        for (const auto& input : GetValueInfos(sorted_graph.GetInputs())) {
+            const auto shape{input.TypeInfo().GetTensorTypeAndShapeInfo().GetShape()};
+            hash::Hash(input_shapes_hash, shape);
+        }
+        input_shapes_hash_hex = hash::ToHex(input_shapes_hash);
+
+        if (!use_plan_cache) {
+        fs::path mxr_path;
+        if (!effective_cache_dir.empty()) {
+            mxr_path = effective_cache_dir / (mxr_prefix + input_shapes_hash_hex + ".mxr");
+        }
+        loaded_from_cache = !force_recompile_ && load_compiled_program(program, mxr_path);
+        backend_telemetry_.loaded_from_cache = loaded_from_cache;
+        if (!loaded_from_cache) {
+            const auto external_data_dir{external_data_dir_.empty() ?
+                model_path.parent_path() : external_data_dir_};
+            onnx_options.set_external_data_path(external_data_dir.string());
+            program = migraphx::parse_onnx_buffer(onnx_string, onnx_options);
+            migraphx::program_parameters params;
+            calibrate_and_quantize(program, t_, params, enable_fp16_, enable_bf16_, enable_int8_,
+                enable_fp8_, int8_calibration_cache_available_, dynamic_ranges_);
+            compile_program(program, t_, exhaustive_tune_, mlss_use_specific_ops_, compute_mode_,
+                problem_cache_paths_);
+            // context_enable needs this file on disk even if caching is otherwise disabled.
+            if (!disable_compiled_model_caching_ || context_enable_) {
+                save_compiled_program(program, mxr_path);
+            }
+        }
+        const auto output_shapes{program.get_output_shapes()};
+        for (const auto& [n, s] : zip(output_names, output_shapes)) {
+            onnx_options.set_input_parameter_shape(n, s.lengths());
+        }
+        }
+    }
+
+    if (context_enable_) {
+        // input_shapes_hash_hex is non-empty here: the RETURN_IF above requires has_input_shape.
+        const fs::path ep_context_mxr_path{mxr_prefix + input_shapes_hash_hex + ".mxr"};
+
+        EpContextNodeHelper ep_context_helper{*this, sorted_graph, fused_node};
+        RETURN_IF_ERROR(ep_context_helper.CreateEpContextNode(ep_context_mxr_path, effective_cache_dir,
+            context_embed_mode_, compute_capability_, model_path, context_node_name_prefix_,
+            ep_context_node));
+    }
+
+    auto [state_it, inserted] = compute_states_.emplace(subgraph_name,
+        ComputeState{
+            mutex_,
+            device_id_,
+            t_,
+            onnx_options,
+            program,
+            enable_fp16_,
+            enable_bf16_,
+            enable_fp8_,
+            enable_int8_,
+            int8_calibration_cache_available_,
+            has_input_shape,
+            dump_subgraphs_,
+            exhaustive_tune_,
+            mlss_use_specific_ops_,
+            dynamic_ranges_,
+            input_name_indices,
+            output_name_indices,
+            onnx_string,
+            compute_mode_,
+            model_path,
+            effective_cache_dir,
+            disable_compiled_model_caching_,
+            force_recompile_,
+            external_data_dir_,
+            mxr_prefix,
+            problem_cache_paths_,
+        });
+
+    // Propagate hipGraph / dynamic-batch configuration onto the compute state.
+    auto& compute_state{state_it->second};
+    compute_state.hip_graph_enable = hip_graph_enable_;
+    compute_state.max_dynamic_batch = max_dynamic_batch_;
+    compute_state.compile_batches = compile_batches_;
+    compute_state.coalesce_io = coalesce_io_enable_;
+    compute_state.static_pad_seq = static_pad_seq_;
+    compute_state.static_pad_seq_len = static_pad_seq_len_;
+    compute_state.static_pad_seq_len_from_env = static_pad_seq_len_from_env_;
+    if (static_pad_seq_) {
+        // static-pad and dynamic batching both rewrite shapes; combined, the staging copies
+        // collide. Unsupported together.
+        if (max_dynamic_batch_ > 0) {
+            return Ort::Status{"static seq-padding is not supported with dynamic batching "
+                "(max_dynamic_batch > 0); disable one", ORT_EP_FAIL};
+        }
+        compute_state.static_pad_input_axes = ParseNameAxisSpec(static_pad_inputs_);
+        // Outputs: MIGraphX program params are named "#output_N", not their ONNX
+        // names, so resolve the user's "logits:1" spec to (ORT output index -> axis)
+        // via output_name_indices; the runtime slice matches on index.
+        compute_state.static_pad_output_axes_by_index.clear();
+        for (const auto& [oname, axis] : ParseNameAxisSpec(static_pad_outputs_)) {
+            if (const auto it{output_name_indices.find(oname)}; it != output_name_indices.end()) {
+                compute_state.static_pad_output_axes_by_index.emplace(it->second, axis);
+            }
+        }
+        // No named inputs -> nothing to pad; keep the feature inert.
+        if (compute_state.static_pad_input_axes.empty()) {
+            compute_state.static_pad_seq = false;
+        }
+    }
+
+    if (max_dynamic_batch_ > 0 || !compile_batches_.empty()) {
+        compute_state.has_dynamic_batch = max_dynamic_batch_ > 0;
+        compute_state.compiled_batch_sizes = GenerateCompiledBatchSizes(
+            max_dynamic_batch_, compile_batches_);
+    }
+
+    compute_state.defer_compilation = true;
+    if (use_plan_cache) {
+        RETURN_IF_ERROR(PreloadMxrPrograms(pre_plan, input_name_indices, compute_state.cached_programs,
+            force_recompile_, effective_cache_dir, mxr_prefix));
+        if (precompile_at_load_) {
+            RETURN_IF_ERROR(CompileMissingPrograms(pre_plan, input_name_indices, onnx_string,
+                compute_state.cached_programs, t_, enable_fp16_, enable_bf16_, enable_int8_, enable_fp8_,
+                int8_calibration_cache_available_, dynamic_ranges_, exhaustive_tune_, mlss_use_specific_ops_,
+                compute_mode_, problem_cache_paths_, disable_compiled_model_caching_, model_path,
+                external_data_dir_, effective_cache_dir, mxr_prefix));
+        }
+        if (!compute_state.cached_programs.empty()) {
+            compute_state.program = SelectDefaultProgram(compute_state.cached_programs, pre_bucketed,
+                pre_batch_sizes, pre_shapes_by_name, input_name_indices);
+            if (pre_bucketed) {
+                compute_state.compiled_batch_sizes = pre_batch_sizes;
+                compute_state.has_dynamic_batch = true;
+            } else {
+                compute_state.has_input_shapes = true;
+                const auto output_shapes{compute_state.program.get_output_shapes()};
+                for (const auto& [n, s] : zip(output_names, output_shapes)) {
+                    compute_state.onnx_options.set_input_parameter_shape(n, s.lengths());
+                }
+            }
+            backend_telemetry_.loaded_from_cache = true;
+        }
+        compute_state.defer_compilation = AnyPlannedTargetMissing(pre_plan, input_name_indices,
+            compute_state.cached_programs);
+    } else if (has_input_shape && program.get_parameter_shapes().size() > 0) {
+        compute_state.defer_compilation = false;
+    }
+
+    node_compute_info = std::make_unique<NodeComputeInfo>(*this).release();
+    return STATUS_OK;
+}
+
+Ort::Status ExecutionProvider::CreateNodeComputeInfoFromCache(const Ort::ConstGraph& graph,
+    const Ort::ConstNode& fused_node, const Map<size_t>& input_name_indices, const Map<size_t>& output_name_indices,
+    OrtNodeComputeInfo*& node_compute_info)
+{
+    std::string name{fused_node.GetName()};
+
+    fs::path ctx_cache_dir{cache_dir_};
+    if (ctx_cache_dir.empty()) {
+        if (!context_file_path_.empty()) {
+            ctx_cache_dir = context_file_path_.parent_path();
+        } else {
+            const auto model_path{graph.GetModelPath()};
+            if (!model_path.empty()) {
+                ctx_cache_dir = fs::path{model_path}.parent_path();
+            }
+        }
+    }
+
+    const auto current_sdk_version{
+        std::to_string(MIGRAPHX_VERSION_MAJOR) + "." +
+        std::to_string(MIGRAPHX_VERSION_MINOR) + "." +
+        std::to_string(MIGRAPHX_VERSION_PATCH)};
+
+    try {
+        EpContextNodeReader ep_ctx_reader{*this, graph, logger_, ctx_cache_dir,
+            compute_capability_, current_sdk_version};
+
+        ep_context_compute_states_.emplace(name,
+            EpContextComputeState{
+                mutex_,
+                device_id_,
+                t_,
+                ep_ctx_reader.GetProgram(),
+                input_name_indices,
+                output_name_indices,
+            });
+    } catch (const std::exception& e) {
+        return Ort::Status{e.what(), ORT_INVALID_GRAPH};
+    }
+
+    node_compute_info = std::make_unique<EpContextNodeComputeInfo>(*this).release();
+    return STATUS_OK;
+}
+
+Ort::Status ExecutionProvider::Compile(const std::vector<Ort::ConstGraph>& graphs,
+    const std::vector<Ort::ConstNode>& fused_nodes, gsl::span<OrtNodeComputeInfo*> node_compute_infos,
+    gsl::span<OrtNode*> ep_context_nodes) noexcept
+try {
+    // Reset the backend-specific telemetry gathered for this compile. Generic
+    // fields (model, version, ...) are collected by the wrapper; here we only
+    // record what is specific to MIGraphX (gfx arch and MXR cache state).
+    backend_telemetry_.backend = telemetry::Backend::MIGraphX;
+    backend_telemetry_.has_gfx_arch = !compute_capability_.empty();
+    std::snprintf(backend_telemetry_.gfx_arch, sizeof(backend_telemetry_.gfx_arch),
+        "%s", compute_capability_.c_str());
+    backend_telemetry_.has_loaded_from_cache = true;
+    backend_telemetry_.loaded_from_cache = false;
+
+    for (const auto& [graph, fused_node, node_compute_info, ep_context_node] : zip(graphs, fused_nodes, node_compute_infos, ep_context_nodes)) {
+        const auto input_name_indices{BuildInputNameIndices(graph, fused_node)};
+        const auto outputs{GetValueInfos(fused_node.GetOutputs())};
+        std::unordered_map<std::string, size_t> output_name_indices;
+        output_name_indices.reserve(outputs.size());
+        for (const auto& [i, output] : enumerate(outputs)) {
+            output_name_indices.emplace(output.GetName(), i);
+        }
+
+        if (EpContextNodeReader::GraphHasContextNode(graph)) {
+            backend_telemetry_.loaded_from_cache = true;
+            RETURN_IF_ERROR(CreateNodeComputeInfoFromCache(graph, fused_node, input_name_indices,
+                output_name_indices, node_compute_info));
+        } else {
+            // The compute mode is part of the key: two modes produce different
+            // binaries from the same graph, and without this an A/B between
+            // modes silently replays the other mode's cached program.
+            const auto mxr_prefix{hash::ToHex(MIGraphX_Version) + "-" + GenerateGraphId(graph) + "-" +
+                hash::ToHex(std::string_view{device_prop_.gcnArchName}) + "-" +
+                hash::ToHex(static_cast<std::uint64_t>(compute_mode_)) + "-"};
+
+            RETURN_IF_ERROR(CreateNodeComputeInfoFromGraph(graph, fused_node, input_name_indices,
+                output_name_indices, mxr_prefix, node_compute_info, ep_context_node));
+        }
+    }
+    return STATUS_OK;
+} catch (const Ort::Exception& e) {
+    return Ort::Status{e};
+} catch (const std::exception& e) {
+    return Ort::Status{e.what(), ORT_EP_FAIL};
+}
+
+Ort::Status ExecutionProvider::ReleaseNodeComputeInfos(const gsl::span<OrtNodeComputeInfo*> node_compute_info) noexcept
+try {
+    for (const auto& info : node_compute_info) {
+        delete info;
+    }
+    return STATUS_OK;
+} catch (const Ort::Exception& e) {
+    return Ort::Status{e};
+} catch (const std::exception& e) {
+    return Ort::Status{e.what(), ORT_EP_FAIL};
+}
+
+Ort::Status ExecutionProvider::OnRunEnd(const OrtRunOptions* /* run_options */, bool /* sync_stream */) noexcept
+try {
+    HIP_RETURN_IF_ERROR(hipSetDevice(device_id_));
+    return STATUS_OK;
+} catch (const Ort::Exception& e) {
+    return Ort::Status{e};
+} catch (const std::exception& e) {
+    return Ort::Status{e.what(), ORT_EP_FAIL};
+}
+
+Ort::Status ExecutionProvider::CreateSyncStreamForDevice(const OrtMemoryDevice* memory_device, OrtSyncStreamImpl** stream)
+try {
+    *stream = std::make_unique<hip::SyncStream>(*this, device_id_, nullptr).release();
+    return STATUS_OK;
+} catch (const Ort::Exception& e) {
+    return Ort::Status{e};
+} catch (const std::exception& e) {
+    return Ort::Status{e.what(), ORT_EP_FAIL};
+}
+
+Ort::Status ExecutionProvider::GetKernelRegistry(const OrtKernelRegistry** kernel_registry) const
+try {
+    return factory_.GetKernelRegistry(ep_name_, *kernel_registry);
+} catch (const Ort::Exception& e) {
+    return Ort::Status{e};
+} catch (const std::exception& e) {
+    return Ort::Status{e.what(), ORT_EP_FAIL};
+}
+
+Ort::Status NodeComputeInfo::CreateState(OrtNodeComputeContext* compute_context, void*& compute_state) noexcept
+try {
+    const auto fused_node_name{ep_.ep_api.NodeComputeContext_NodeName(compute_context)};
+    auto& cs{ep_.GetComputeState(fused_node_name)};
+    compute_state = &cs;
+    return STATUS_OK;
+} catch (const Ort::Exception& e) {
+    return Ort::Status{e};
+} catch (const std::exception& e) {
+    return Ort::Status{e.what(), ORT_EP_FAIL};
+}
+
+Ort::Status NodeComputeInfo::Compute(ComputeState& compute_state, const Ort::KernelContext& kernel_context) noexcept
+    try {
+    const auto& input_name_indices{compute_state.input_name_indices};
+    auto& program{compute_state.program};
+    auto& onnx_options{compute_state.onnx_options};
+
+    bool input_shapes_match{compute_state.has_input_shapes};
+    migraphx::program_parameter_shapes param_shapes;
+    hash::Value input_shapes_hash{};
+
+    // Resolve dynamic-batch bucketing for this call (no-op when disabled).  The
+    // batch is assumed to live on axis 0 of the model inputs.
+    DynamicBatchContext dyn{};
+    if (compute_state.max_dynamic_batch > 0) {
+        if (compute_state.compiled_batch_sizes.empty()) {
+            compute_state.compiled_batch_sizes = GenerateCompiledBatchSizes(
+                compute_state.max_dynamic_batch, compute_state.compile_batches);
+        }
+        bool have_min{false};
+        size_t min_index{0};
+        size_t requested{0};
+        for (const auto& [name, index] : input_name_indices) {
+            const auto shape{kernel_context.GetInput(index).GetTensorTypeAndShapeInfo().GetShape()};
+            if (!shape.empty() && (!have_min || index < min_index)) {
+                have_min = true;
+                min_index = index;
+                requested = static_cast<size_t>(shape.front());
+            }
+        }
+        if (requested > 0) {
+            const auto bucket{FindNearestCompiledBatchSize(requested, compute_state.compiled_batch_sizes)};
+            dyn.requested_batch = requested;
+            dyn.target_batch = bucket > 0 ? bucket : requested;
+            dyn.active = true;
+        }
+    }
+
+    // Resolve static seq-padding for this call (no-op when disabled).  A named input
+    // is padded on its token axis to the fixed target length, only for prefill: the
+    // axis extent must be in (1, target).  decode (extent == 1) and already-max
+    // prompts are left alone.  Inert when static_pad_seq_len == 0.
+    StaticSeqContext seq{};
+    if (compute_state.static_pad_seq) {
+        // Take the target from the attention mask (axis 1; axis 0 is batch, scaled by num_beams).
+        // It carries the length the caller is really generating with, and is the same length it
+        // sized its KV cache to.  The configured value cannot be trusted here: for OGA it is
+        // config.search.max_length, read while the session is created, so a caller that sets
+        // max_length on GeneratorParams sets it too late for us and we would pad to the model's
+        // full context.  An explicit env value still wins; models with no mask keep the
+        // configured length.
+        static const std::string kAttentionMaskInput{"attention_mask"};
+        std::size_t target{compute_state.static_pad_seq_len};
+        if (not compute_state.static_pad_seq_len_from_env) {
+            if (const auto mask_it{input_name_indices.find(kAttentionMaskInput)};
+                mask_it != input_name_indices.end()) {
+                const auto mask_shape{
+                    kernel_context.GetInput(mask_it->second).GetTensorTypeAndShapeInfo().GetShape()};
+                if (mask_shape.size() > 1 && mask_shape[1] > 0) {
+                    target = static_cast<std::size_t>(mask_shape[1]);
+                }
+            }
+        }
+        for (const auto& [name, axis] : compute_state.static_pad_input_axes) {
+            if (target == 0) {
+                break;  // nothing usable to pad to -> leave shapes untouched (inert, as before)
+            }
+            const auto it{input_name_indices.find(name)};
+            if (it == input_name_indices.end()) {
+                continue;
+            }
+            const auto shape{kernel_context.GetInput(it->second).GetTensorTypeAndShapeInfo().GetShape()};
+            if (axis < 0 || static_cast<size_t>(axis) >= shape.size()) {
+                continue;
+            }
+            const auto extent{static_cast<size_t>(shape[axis])};
+            if (extent > 1 && extent < target) {
+                seq.active = true;
+                seq.real_len = extent;
+                seq.target_len = target;
+                seq.input_axes = &compute_state.static_pad_input_axes;
+                seq.output_axes_by_index = &compute_state.static_pad_output_axes_by_index;
+                break;  // all named inputs share the same token length this call
+            }
+        }
+    }
+
+    // Map an actual input shape to the shape the program is compiled for: a batched
+    // input (axis-0 extent == requested batch) is bucketed up to the target batch,
+    // and a named seq input has its token axis padded up to the static target length.
+    const auto effective_shape{[&dyn, &seq](std::vector<int64_t> shape,
+                                            const std::string& name) {
+        if (dyn.active && !shape.empty() &&
+            static_cast<size_t>(shape.front()) == dyn.requested_batch) {
+            shape.front() = static_cast<int64_t>(dyn.target_batch);
+        }
+        if (seq.active && seq.input_axes != nullptr) {
+            if (const auto it{seq.input_axes->find(name)}; it != seq.input_axes->end()) {
+                const int axis{it->second};
+                if (axis >= 0 && static_cast<size_t>(axis) < shape.size() &&
+                    static_cast<size_t>(shape[axis]) == seq.real_len) {
+                    shape[axis] = static_cast<int64_t>(seq.target_len);
+                }
+            }
+        }
+        return shape;
+    }};
+
+    // Item 4: gather the actual input shapes once.  If they are identical to the
+    // previous call we can skip both the shape-compare loop and the rehash loop:
+    // identical actual shapes imply an identical effective shape, dyn bucket, and
+    // hash, and (since the program was already compiled for them last time) a match.
+    std::vector<std::int64_t> current_input_shapes;
+    current_input_shapes.reserve(input_name_indices.size() * 4);
+    for (const auto& [name, index] : input_name_indices) {
+        const auto shape{kernel_context.GetInput(index).GetTensorTypeAndShapeInfo().GetShape()};
+        current_input_shapes.insert(current_input_shapes.end(), shape.begin(), shape.end());
+    }
+    const bool shapes_unchanged{compute_state.has_last_input_shapes &&
+                                current_input_shapes == compute_state.last_input_shapes};
+
+    if (shapes_unchanged) {
+        input_shapes_hash = compute_state.last_input_shapes_hash;
+        input_shapes_match = true;
+        param_shapes = program.get_parameter_shapes();
+    } else if (!compute_state.has_input_shapes) {
+        for (auto& [name, index] : input_name_indices) {
+            auto value{kernel_context.GetInput(index)};
+            auto shape{effective_shape(value.GetTensorTypeAndShapeInfo().GetShape(), name)};
+            onnx_options.set_input_parameter_shape(name, {shape.begin(), shape.end()});
+            hash::Hash(input_shapes_hash, shape);
+        }
+        compute_state.has_input_shapes = true;
+    } else {
+        param_shapes = program.get_parameter_shapes();
+
+        // check whether input shapes match with shapes of program inputs
+        if (param_shapes.size() > 0) {
+            for (const auto& name : param_shapes.names()) {
+                if (input_name_indices.count(name) > 0) {
+                    auto value{kernel_context.GetInput(input_name_indices.at(name))};
+                    auto shape{value.GetTensorTypeAndShapeInfo().GetShape()};
+                    auto prog_shape{param_shapes[name]};
+                    auto prog_lengths{prog_shape.lengths()};
+                    auto prog_strides{prog_shape.strides()};
+                    if (prog_lengths.size() == 1 && prog_lengths.front() == 1 &&
+                        prog_strides.size() == 1 && prog_strides.front() == 0) {
+                        prog_lengths.clear();
+                    }
+                    const auto eff{effective_shape(shape, name)};
+                    std::vector<size_t> lengths{eff.begin(), eff.end()};
+                    if (prog_lengths != lengths) {
+                        onnx_options.set_input_parameter_shape(name, lengths);
+                        input_shapes_match = false;
+                    }
+                }
+            }
+        }
+
+        // Compute hash over all model inputs, consistent with the first-call path.
+        // The shape comparison above iterates param_shapes.names() which may be a
+        // subset of input_name_indices if MIGraphX optimized away parameters during
+        // compilation. Using input_name_indices ensures the cache key is identical
+        // for identical input shapes regardless of which program is currently active.
+        for (const auto& [name, index] : input_name_indices) {
+            auto value{kernel_context.GetInput(index)};
+            auto shape{effective_shape(value.GetTensorTypeAndShapeInfo().GetShape(), name)};
+            hash::Hash(input_shapes_hash, shape);
+        }
+    }
+
+    // If the input shapes are different (e.g., LLMs), the EP needs to reparse and recompile the program
+    if (!input_shapes_match) {
+        const std::string current_hash{hash::ToHex(input_shapes_hash)};
+        bool loaded_from_cache{false};
+
+        if (const auto cit{compute_state.cached_programs.find(current_hash)};
+            cit != compute_state.cached_programs.end()) {
+            program = cit->second;
+            loaded_from_cache = true;
+        } else if (compute_state.hip_graph_enable && !dyn.active) {
+            // Unbounded dynamic-shape (e.g. LLM) path: keep only the current shape's
+            // graph/staging, so invalidate before the program changes.
+            DestroyHipGraphs(compute_state);
+            FreeStaging(compute_state);
+        }
+
+        if (!loaded_from_cache) {
+        migraphx::program_parameters compile_params{};
+        fs::path mxr_path;
+        if (!compute_state.cache_dir.empty()) {
+            mxr_path = compute_state.cache_dir / (compute_state.mxr_prefix + current_hash + ".mxr");
+        }
+        if (compute_state.force_recompile || !load_compiled_program(program, mxr_path)) {
+            const auto external_data_dir{compute_state.external_data_dir.empty() ?
+                compute_state.model_path.parent_path() : compute_state.external_data_dir};
+            onnx_options.set_external_data_path(external_data_dir.string());
+            program = migraphx::parse_onnx_buffer(compute_state.onnx_string, onnx_options);
+            param_shapes = program.get_parameter_shapes();
+            if ((compute_state.enable_int8 ^ compute_state.enable_fp8) && compute_state.int8_calibration_cache_available) {
+                for (const auto& name : param_shapes.names()) {
+                    if (input_name_indices.count(name) > 0) {
+                        const auto index{input_name_indices.at(name)};
+                        auto value{kernel_context.GetInput(index)};
+                        auto tensor_info{value.GetTensorTypeAndShapeInfo()};
+                        const auto tensor_shape{tensor_info.GetShape()};
+                        const auto tensor_type{tensor_info.GetElementType()};
+
+                        migraphx_shape_datatype_t datatype;
+                        GetMIGraphXType(tensor_type, datatype);
+
+                        if (const auto prog_shapes{param_shapes[name]}; datatype != prog_shapes.type()) {
+                            throw std::runtime_error{"NodeComputeInfo::Compute(): input parameter type mismatch"};
+                        }
+
+                        compile_params.add(name, migraphx::argument{param_shapes[name],
+                            GetGpuInputData(compute_state, kernel_context, name, index, param_shapes[name], nullptr)});
+                    }
+                }
+            }
+            calibrate_and_quantize(program, compute_state.t, compile_params,
+                compute_state.enable_fp16, compute_state.enable_bf16, compute_state.enable_int8,
+                compute_state.enable_fp8, compute_state.int8_calibration_cache_available, compute_state.dynamic_ranges);
+
+            compile_program(program, compute_state.t, compute_state.exhaustive_tune,
+                compute_state.mlss_use_specific_ops, compute_state.compute_mode,
+                compute_state.problem_cache_paths);
+            if (!compute_state.disable_compiled_model_caching) {
+                save_compiled_program(program, mxr_path);
+            }
+        }
+            // Keep a copy of the freshly compiled program so it (and any graph
+            // captured against it) survives later shape/bucket switches.
+            if (dyn.active || !compute_state.defer_compilation) {
+                compute_state.cached_programs.emplace(current_hash, program);
+            }
+            // The program for this hash was (re)built, so any binding cached
+            // against the previous program for the same hash is stale.
+            compute_state.staging_bind_cache.erase(current_hash);
+        }
+        param_shapes = program.get_parameter_shapes();
+    }
+
+    // Item 4: remember these shapes so the next identical call takes the fast path.
+    // Set only after the (possible) recompile above, so the recorded hash always
+    // corresponds to a program that is compiled and ready for these shapes.
+    if (!shapes_unchanged) {
+        compute_state.last_input_shapes = std::move(current_input_shapes);
+        compute_state.last_input_shapes_hash = input_shapes_hash;
+        compute_state.has_last_input_shapes = true;
+    }
+
+    // Staging path: required for hipGraph capture (pointer stability) and for
+    // dynamic batching (input padding / output slicing).  Stage I/O into EP-owned
+    // buffers, bind scratch, then replay/capture a graph or run eagerly
+    if ((compute_state.hip_graph_enable || dyn.active || seq.active) && param_shapes.size() > 0) {
+        const auto shape_hash{hash::ToHex(input_shapes_hash)};
+        const auto hip_stream{static_cast<hipStream_t>(kernel_context.GetGPUComputeStream())};
+        HIP_RETURN_IF_ERROR(hipSetDevice(compute_state.device_id));
+        AllocateStaging(compute_state, param_shapes, hip_stream, dyn);
+        CopyInputsToStaging(compute_state, param_shapes, kernel_context, hip_stream, dyn, seq);
+        // Item 3: reuse a cached binding for this shape hash.  Staging buffers and
+        // scratch are pointer-stable until FreeStaging, so binding once and replaying
+        // avoids re-doing N program_parameters.add() calls, string work, and a
+        // scratch lookup on every inference.
+        auto bind_it{compute_state.staging_bind_cache.find(shape_hash)};
+        if (bind_it == compute_state.staging_bind_cache.end()) {
+            bind_it = compute_state.staging_bind_cache.emplace(
+                shape_hash,
+                BindStagingParams(compute_state, param_shapes, shape_hash, hip_stream)).first;
+        }
+        auto& bind{bind_it->second};
+        RunProgramOrHipGraph(compute_state, hip_stream, kernel_context, program,
+            bind.params, bind.prog_output_indices, shape_hash, dyn);
+        CopyStagingOutputsToOrt(compute_state, bind, kernel_context, hip_stream, dyn, seq);
+        // ORT fetches the outputs before its run-end Flush, and reaches DataTransfer
+        // with a null stream on some paths, which orders nothing against this
+        // hipStreamNonBlocking stream. Sync so that read cannot race in-flight compute.
+        HIP_RETURN_IF_ERROR(hipStreamSynchronize(hip_stream));
+        return STATUS_OK;
+    }
+
+    migraphx::program_parameters compute_params;
+    auto output_shapes{program.get_output_shapes()};
+    std::vector<size_t> output_indices;
+    HIP_RETURN_IF_ERROR(hipSetDevice(compute_state.device_id));
+    const auto hip_stream{static_cast<hipStream_t>(kernel_context.GetGPUComputeStream())};
+    if (param_shapes.size() > 0) {
+        for (std::string name : param_shapes.names()) {
+            if (input_name_indices.count(name) > 0) {
+                const auto index{input_name_indices.at(name)};
+                auto input_tensor{kernel_context.GetInput(index)};
+                auto tensor_info{input_tensor.GetTensorTypeAndShapeInfo()};
+                auto tensor_type{tensor_info.GetElementType()};
+
+                migraphx_shape_datatype_t datatype;
+                GetMIGraphXType(tensor_type, datatype);
+
+                const auto prog_shape{param_shapes[name.c_str()]};
+                if (datatype != prog_shape.type()) {
+                    throw std::runtime_error{"NodeComputeInfo::Compute(): tensor parameter type mismatch"};
+                }
+                void* input_data{GetGpuInputData(compute_state, kernel_context, name, index, prog_shape, hip_stream)};
+                compute_params.add(name.c_str(), migraphx::argument{prog_shape, input_data});
+            } else {
+                // it is an output argument
+                constexpr std::string_view name_prefix{"#output_"};
+                if (const auto pos{name.find(name_prefix)}; pos != std::string_view::npos) {
+                    const auto sub{name.substr(pos + name_prefix.length())};
+                    auto output_index{ToInteger<size_t>(Trim(sub, std::isdigit))};
+                    output_indices.emplace_back(output_index);
+
+                    auto output_shape{output_shapes[output_index]};
+                    const auto lengths{output_shape.lengths()};
+                    std::vector<int64_t> tensor_shape{lengths.begin(), lengths.end()};
+                    auto output_tensor{kernel_context.GetOutput(output_index, tensor_shape.data(), tensor_shape.size())};
+                    void* output_data{output_tensor.GetTensorMutableRawData()};
+                    auto argument_shape{param_shapes[name.c_str()]};
+                    compute_params.add(name.c_str(), migraphx::argument{argument_shape, output_data});
+                } else {
+                    return Ort::Status{MakeString("NodeComputeInfo::Compute(): unbound program parameter '",
+                        name, "'").c_str(), ORT_EP_FAIL};
+                }
+            }
+        }
+    }
+    {
+        std::lock_guard lock{compute_state.mutex};
+
+        auto prog_outputs{program.run_async(compute_params, hip_stream)};
+
+        if (auto output_size{prog_outputs.size()}; output_indices.size() < output_size) {
+            for (size_t i{}; i < output_size; ++i) {
+                if (ranges::find(output_indices, i) != output_indices.end()) {
+                    continue;
+                }
+                auto gpu_resource{prog_outputs[i]};
+                migraphx::shape resource_shape{gpu_resource.get_shape()};
+                auto resource_lengths{resource_shape.lengths()};
+                std::vector<int64_t> shapes{resource_lengths.begin(), resource_lengths.end()};
+                auto output_tensor{kernel_context.GetOutput(i, shapes)};
+                void* output_data{output_tensor.GetTensorMutableRawData()};
+                HIP_CALL_THROW(hipMemcpyWithStream(output_data, gpu_resource.data(), resource_shape.bytes(),
+                    hipMemcpyDeviceToDevice, hip_stream));
+            }
+        }
+        // ORT fetches the outputs before its run-end Flush, and reaches DataTransfer
+        // with a null stream on some paths, which orders nothing against this
+        // hipStreamNonBlocking stream. Sync so that read cannot race in-flight compute.
+        HIP_RETURN_IF_ERROR(hipStreamSynchronize(hip_stream));
+    }
+    return STATUS_OK;
+} catch (const Ort::Exception& e) {
+    return Ort::Status{e};
+} catch (const std::exception& e) {
+    return Ort::Status{e.what(), ORT_EP_FAIL};
+}
+
+Ort::Status EpContextNodeComputeInfo::CreateState(OrtNodeComputeContext* compute_context, void*& compute_state) noexcept
+try {
+    const auto fused_node_name{ep_.ep_api.NodeComputeContext_NodeName(compute_context)};
+    auto& cs{ep_.EpContext_GetComputeState(fused_node_name)};
+    compute_state = &cs;
+    return STATUS_OK;
+} catch (const Ort::Exception& e) {
+    return Ort::Status{e};
+} catch (const std::exception& e) {
+    return Ort::Status{e.what(), ORT_EP_FAIL};
+}
+
+Ort::Status EpContextNodeComputeInfo::Compute(EpContextComputeState& compute_state, const Ort::KernelContext& kernel_context) noexcept
+try {
+    const auto& input_name_indices{compute_state.input_name_indices};
+    auto& program{compute_state.program};
+
+    auto param_shapes{program.get_parameter_shapes()};
+    auto output_shapes{program.get_output_shapes()};
+
+    migraphx::program_parameters compute_params;
+    std::vector<size_t> output_indices;
+
+    if (param_shapes.size() > 0) {
+        for (std::string name : param_shapes.names()) {
+            if (input_name_indices.count(name) > 0) {
+                const auto index{input_name_indices.at(name)};
+                auto input_tensor{kernel_context.GetInput(index)};
+                auto tensor_info{input_tensor.GetTensorTypeAndShapeInfo()};
+                auto tensor_type{tensor_info.GetElementType()};
+
+                migraphx_shape_datatype_t datatype;
+                GetMIGraphXType(tensor_type, datatype);
+
+                if (auto prog_shape{param_shapes[name.c_str()]}; datatype != prog_shape.type()) {
+                    throw std::runtime_error{"EpContextNodeComputeInfo::Compute(): tensor parameter type mismatch"};
+                }
+                compute_params.add(name.c_str(), migraphx::argument{param_shapes[name.c_str()],
+                    const_cast<void*>(input_tensor.GetTensorRawData())});
+            } else {
+                constexpr std::string_view name_prefix{"#output_"};
+                if (const auto pos{name.find(name_prefix)}; pos != std::string_view::npos) {
+                    const auto sub{name.substr(pos + name_prefix.length())};
+                    auto output_index{ToInteger<size_t>(Trim(sub, std::isdigit))};
+                    output_indices.emplace_back(output_index);
+
+                    auto output_shape{output_shapes[output_index]};
+                    const auto lengths{output_shape.lengths()};
+                    std::vector<int64_t> tensor_shape{lengths.begin(), lengths.end()};
+                    auto output_tensor{kernel_context.GetOutput(output_index, tensor_shape.data(), tensor_shape.size())};
+                    void* output_data{output_tensor.GetTensorMutableRawData()};
+                    auto argument_shape{param_shapes[name.c_str()]};
+                    compute_params.add(name.c_str(), migraphx::argument{argument_shape, output_data});
+                } else {
+                    return Ort::Status{MakeString("EpContextNodeComputeInfo::Compute(): unbound program parameter '",
+                        name, "'").c_str(), ORT_EP_FAIL};
+                }
+            }
+        }
+    }
+    {
+        std::lock_guard lock{compute_state.mutex};
+
+        HIP_RETURN_IF_ERROR(hipSetDevice(compute_state.device_id));
+        auto hip_stream{static_cast<hipStream_t>(kernel_context.GetGPUComputeStream())};
+        auto prog_outputs{program.run_async(compute_params, hip_stream)};
+
+        if (auto output_size{prog_outputs.size()}; output_indices.size() < output_size) {
+            for (size_t i{}; i < output_size; ++i) {
+                if (ranges::find(output_indices, i) != output_indices.end()) {
+                    continue;
+                }
+                auto gpu_resource{prog_outputs[i]};
+                migraphx::shape resource_shape{gpu_resource.get_shape()};
+                auto resource_lengths{resource_shape.lengths()};
+                std::vector<int64_t> shapes{resource_lengths.begin(), resource_lengths.end()};
+                auto output_tensor{kernel_context.GetOutput(i, shapes)};
+                void* output_data{output_tensor.GetTensorMutableRawData()};
+                HIP_CALL_THROW(hipMemcpyWithStream(output_data, gpu_resource.data(), resource_shape.bytes(),
+                    hipMemcpyDeviceToDevice, hip_stream));
+            }
+        }
+        // ORT fetches the outputs before its run-end Flush, and reaches DataTransfer
+        // with a null stream on some paths, which orders nothing against this
+        // hipStreamNonBlocking stream. Sync so that read cannot race in-flight compute.
+        HIP_RETURN_IF_ERROR(hipStreamSynchronize(hip_stream));
+    }
+    return STATUS_OK;
+} catch (const Ort::Exception& e) {
+    return Ort::Status{e};
+} catch (const std::exception& e) {
+    return Ort::Status{e.what(), ORT_EP_FAIL};
+}
+
+}  // namespace mgx_ep
+
+// Telemetry collector exported for the amdgpu wrapper. The wrapper resolves this
+// by symbol (see telemetry::kGetBackendDataSymbol) and calls it with a live
+// backend EP to pull MIGraphX-specific telemetry.
+extern "C" bool GetBackendTelemetry(const OrtEp* ep, telemetry::BackendData* out) noexcept {
+    if (ep == nullptr || out == nullptr) {
+        return false;
+    }
+    static_cast<const mgx_ep::ExecutionProvider*>(ep)->CollectTelemetry(*out);
+    return true;
+}

@@ -1,0 +1,101 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+#pragma once
+
+#include <string_view>
+#include "dml_execution_provider.h"
+#include "DmlExecutionProvider/inc/IWinmlExecutionProvider.h"
+#include "OperatorAuthorHelper/MLOperatorAuthorPrivate.h"
+#include "dml_plugin_MLOperatorAuthorImpl.h"
+
+namespace dml_ep {
+
+class PluginAbiCustomRegistry : public Com<IMLOperatorRegistry, IMLOperatorRegistryPrivate> {
+public:
+    PluginAbiCustomRegistry();
+    PluginAbiCustomRegistry(const dml_ep::PluginDmlExecutionProviderImpl* executionProvider,
+                            std::string_view ep_name);
+
+    HRESULT STDMETHODCALLTYPE RegisterOperatorSetSchema(
+        const MLOperatorSetId* opSetId,
+        int baseline_version,
+        const MLOperatorSchemaDescription* const* schema,
+        uint32_t schemaCount,
+        _In_opt_ IMLOperatorTypeInferrer* typeInferrer,
+        _In_opt_ IMLOperatorShapeInferrer* shapeInferrer) const noexcept override;
+
+    HRESULT STDMETHODCALLTYPE RegisterOperatorKernel(
+        const MLOperatorKernelDescription* operatorKernel,
+        IMLOperatorKernelFactory* operatorKernelFactory,
+        _In_opt_ IMLOperatorShapeInferrer* shapeInferrer,
+        _In_opt_ IMLOperatorSupportQueryPrivate* supportQuery,
+        bool isInternalOperator,
+        bool supportsGraph,
+        const uint32_t* requiredInputCountForGraph = nullptr,
+        _In_reads_(constantCpuInputCount) const uint32_t* requiredConstantCpuInputs = nullptr,
+        uint32_t constantCpuInputCount = 0,
+        _In_reads_(aliasCount) const std::pair<uint32_t, uint32_t>* aliases = nullptr,
+        uint32_t aliasCount = 0) const noexcept override;
+
+    HRESULT STDMETHODCALLTYPE RegisterOperatorKernel(
+        const MLOperatorKernelDescription* opKernel,
+        IMLOperatorKernelFactory* operatorKernelFactory,
+        _In_opt_ IMLOperatorShapeInferrer* shapeInferrer) const noexcept override;
+
+    std::list<std::shared_ptr<onnxruntime::CustomRegistry>> GetRegistries()
+    {
+        std::list<std::shared_ptr<onnxruntime::CustomRegistry>> registries;
+        for (auto& registry : m_customRegistryOpsetVerMap) {
+            registries.push_back(registry.second);
+        }
+
+        registries.push_back(m_kernelRegistry);
+
+        return registries;
+    }
+
+    std::list<std::shared_ptr<onnxruntime::IOnnxRuntimeOpSchemaCollection>> GetSchemaRegistries() {
+        std::list<std::shared_ptr<onnxruntime::IOnnxRuntimeOpSchemaCollection>> registries;
+        for (auto& registry : m_customRegistryOpsetVerMap) {
+            registries.push_back(registry.second->GetOpschemaRegistry());
+        }
+
+        return registries;
+    }
+
+
+    std::shared_ptr<onnxruntime::CustomRegistry> GetLotusKernelRegistry() { return m_kernelRegistry; }
+
+    std::shared_ptr<InternalRegistrationInfoMap> GetInternalRegInfoMap() const { return m_internalRegInfoMap; }
+
+private:
+    static onnx::OpSchema ConvertOpSchema(_In_z_ const char* domain, const MLOperatorSchemaDescription& abiSchema,
+                                          IMLOperatorTypeInferrer* typeInferrer,
+                                          IMLOperatorShapeInferrer* shapeInferrer);
+
+    static std::string ConvertFormalParameterType(const MLOperatorSchemaEdgeDescription& formalParameter);
+    static onnx::OpSchema::FormalParameterOption ConvertFormalParameterOption(MLOperatorParameterOptions options);
+    static void SetAttributesAndDefaults(onnx::OpSchema& schema, const MLOperatorSchemaDescription& abiSchema);
+
+    static AttributeMap GetDefaultAttributes(const MLOperatorKernelDescription* opKernel);
+
+    std::shared_ptr<onnxruntime::CustomRegistry> m_kernelRegistry;
+
+    // Map between (baseline version, opset version) and registries.  This ensures that no registry has multiple
+    // versions of the same domain within it.  This works around limitations in Lotus op-set version arbitration
+    // (see LotusOpSchemaRegistry::GetSchemaAndHistory).
+    mutable std::map<std::pair<int, int>, std::shared_ptr<onnxruntime::CustomRegistry>> m_customRegistryOpsetVerMap;
+
+    // Map between Lotus KernelDefs and extended data used during partitioning
+    mutable std::shared_ptr<InternalRegistrationInfoMap> m_internalRegInfoMap;
+
+    const dml_ep::PluginDmlExecutionProviderImpl* m_dmlPluginExecutionProvider = nullptr;
+
+    // Runtime EP name supplied at construction by the caller. Used as the provider tag on
+    // registered KernelDefs so ORT can match kernels to this EP by its registered identity.
+    // Previously hardcoded as "DirectMLExecutionProvider".
+    std::string m_epName;
+};
+
+}  // namespace dml_ep

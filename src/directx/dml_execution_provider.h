@@ -1,0 +1,258 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+#pragma once
+
+#include "dml_client.h"
+
+#include "cpu_allocator.h"
+#include "dml_readback_heap.h"
+#include "dml_pooled_upload_heap.h"
+#include "dml_bucketized_buffer_allocator.h"
+#include "dml_host_accessible_allocator.h"
+#include "dml_common.h"
+#include "DmlExecutionProvider/inc/IWinmlExecutionProvider.h"
+#include "DmlExecutionProvider/IExecutionProvider.h"
+#include "iallocator_to_ort_allocator_adapter.h"
+#include "core/graph/ep_api_types.h"
+#include "dml_abi_custom_registry.h"
+#include "DmlExecutionProvider/precomp.h"
+#include "DmlExecutionProvider/DmlReusedCommandListState.h"
+#include "dml_execution_context.h"
+
+namespace onnxruntime {
+class IResourceAccountant;
+class GraphOptimizerRegistry;
+}
+
+namespace dml_ep {
+
+    class PooledUploadHeap;
+    class ReadbackHeap;
+    class ExecutionContext;
+    class BucketizedBufferAllocator;
+    class ExecutionProvider;
+
+    class PluginDmlExecutionProviderImpl 
+        : public Com<IExecutionProvider, IWinmlExecutionProvider>
+        , public ApiPtrs
+    {
+    public:
+        ~PluginDmlExecutionProviderImpl() override;
+
+        PluginDmlExecutionProviderImpl(
+            IDMLDevice* dmlDevice,
+            ID3D12Device* d3d12Device,
+            ExecutionContext* executionContext,
+            const ApiPtrs& api_ptrs,
+            bool enableMetacommands,
+            bool enableGraphCapture,
+            bool enableCpuSyncSpinning,
+            bool disableMemoryArena,
+            // Factory-owned holder for the SHARED host-accessible allocator. All EP instances receive
+            // the same holder; the first to build the allocator publishes it here, later EPs adopt it
+            // -> one allocation map across sessions (fixes the pos_ids_reformat/Reshape MISS). Nullptr
+            // -> fall back to a per-EP allocator (legacy behavior).
+            std::shared_ptr<DmlHostAccessibleAllocator>* factoryHostAllocHolder = nullptr,
+            // Opt-in for host-accessible (CUSTOM/L0) decode inputs (ep.directml.enable_host_accessible).
+            // When false (default) the CUSTOM/L0 allocator is never built.
+            bool enableHostAccessible = false);
+
+        void ReleaseCompletedReferences();
+
+        OrtStatus* CopyTensorsPlugin(const OrtValue** src_tensors_ptr,
+                                    OrtValue** dst_tensors_ptr, OrtSyncStream** streams_ptr,
+                                    size_t num_tensors);
+
+        // IExecutionProvider methods
+        STDMETHOD(GetD3DDevice)(_COM_Outptr_ ID3D12Device** d3dDevice) const noexcept final;
+
+        STDMETHOD(GetDmlDevice)(_COM_Outptr_ IDMLDevice** dmlDevice) const noexcept final;
+
+        STDMETHOD(ExecuteCommandList)(
+            ID3D12GraphicsCommandList* commandList,
+            _Outptr_ ID3D12Fence** fence,
+            _Out_ uint64_t* completionValue
+            ) const noexcept final;
+
+        STDMETHOD(AddUAVBarrier)() const noexcept final;
+
+        STDMETHOD(InitializeOperator)(
+            IDMLCompiledOperator* op,
+            _In_opt_ const DML_BUFFER_BINDING* persistentResourceBinding,
+            gsl::span<const DML_BUFFER_BINDING> inputBindings
+            ) const noexcept final;
+
+        STDMETHOD(ExecuteOperator)(
+            IDMLCompiledOperator* op,
+            _In_opt_ const DML_BUFFER_BINDING* persistentResourceBinding,
+            gsl::span<IMLOperatorTensor*> inputTensors,
+            gsl::span<IMLOperatorTensor*> outputTensors
+            ) const noexcept final;
+
+        STDMETHOD(ExecuteOperator)(
+            IDMLCompiledOperator* op,
+            _In_opt_ const DML_BUFFER_BINDING* persistentResourceBinding,
+            gsl::span<DML_BINDING_DESC> inputTensors,
+            gsl::span<DML_BINDING_DESC> outputTensors
+            ) const noexcept final;
+
+        STDMETHOD(CopyTensor)(IMLOperatorTensor* dst, IMLOperatorTensor* src) const noexcept final;
+        STDMETHOD(CopyTensors)(gsl::span<IMLOperatorTensor*> dst, gsl::span<IMLOperatorTensor*> src) const noexcept final;
+
+        STDMETHOD(FillTensorWithPattern)(
+            IMLOperatorTensor* dst,
+            gsl::span<const std::byte> rawValue
+            ) const noexcept final;
+
+        STDMETHOD(UploadToResource)(ID3D12Resource* dstData, const void* srcData, uint64_t srcDataSize) const noexcept final;
+
+        uint32_t GetSupportedDeviceDataTypeMask() const;
+
+        // IWinmlExecutionProvider methods
+        void QueueReference(IUnknown* object) override;
+
+        void GetShadowCopyIfRequired(
+            bool isInternalOperator,
+            IUnknown* data,
+            IUnknown** dataCopy) const override;
+
+        void GetABIDataInterface(
+            bool isInternalOperator,
+            IUnknown* data,
+            IUnknown** abiData) const override;
+
+       uint64_t TryGetPooledAllocationId(
+            IUnknown* data,
+            bool isInternalOperator) override;
+
+        void GetABIExecutionInterfaceAndInvalidateState(
+            bool isInternalOperator,
+            IUnknown** abiExecutionObject) const override;
+
+        bool TransitionsRequiredForOperator(
+            bool isInternalOperator
+        ) override;
+
+        void TransitionResourcesForOperator(
+            bool isBeforeOp,
+            uint32_t resourceCount,
+            IUnknown** resources
+        ) override;
+
+        STDMETHOD_(D3D12_COMMAND_LIST_TYPE, GetCommandListTypeForQueue)() const override;
+        STDMETHOD_(void, Flush)() const override;
+
+        // Waits for flushed work, discards unflushed work, and discards associated references to
+        // prevent circular references.  Must be the last call on the object before destruction.
+        void Close() override;
+
+        void WaitForOutstandingWork() const;
+
+        // Allocate a resource from pools.  Releasing pooledResource returns it to the pool.
+        STDMETHOD(AllocatePooledResource)(
+            size_t size,
+            AllocatorRoundingMode roundingMode,
+            ID3D12Resource **d3dResource,
+            IUnknown* *pooledResource
+        ) const noexcept final;
+
+        STDMETHOD_(ID3D12Resource*, DecodeResource)(void* allocation) const noexcept final;
+
+        // The bucketized GPU allocator that owns this EP's device tensors. Lets a shared
+        // DMLDataTransfer identify which EP owns a tensor so a copy runs on that EP's own
+        // ExecutionContext/queue/fence.
+        DmlBucketizedBufferAllocator* GetBucketizedAllocator() const noexcept { return m_allocator.get(); }
+
+        std::shared_ptr<onnxruntime::KernelRegistry> GetKernelRegistry() const
+        {
+            return m_kernelRegistry;
+        }
+
+        STDMETHOD_(bool, IsMcdmDevice)() const noexcept final;
+        STDMETHOD_(bool, CustomHeapsSupported)() const noexcept final;
+
+        STDMETHOD_(bool, MetacommandsEnabled)() const noexcept final;
+        bool GraphCaptureEnabled() const noexcept;
+        bool GraphCaptured(int graph_annotation_id) const;
+        Ort::Status ReplayGraph(int graph_annotation_id);
+        Ort::Status OnRunStart(const OrtRunOptions& run_options);
+        Ort::Status OnRunEnd();
+        int GetCurrentGraphAnnotationId() const { return m_currentGraphAnnotationId; }
+        void AppendCapturedGraph(int annotationId, std::unique_ptr<DmlReusedCommandListState> capturedGraph);
+        bool CpuSyncSpinningEnabled() const noexcept;
+        std::shared_ptr<OrtAllocator> GetGpuAllocator();
+        std::shared_ptr<OrtAllocator> GetCpuInputAllocator();
+        // Host-accessible (CPU-writable, CUSTOM/L0 system-memory) allocator for decode inputs.
+        std::shared_ptr<OrtAllocator> GetHostAccessibleAllocator();
+
+        std::shared_ptr<const InternalRegistrationInfoMap>
+        GetInternalRegistrationInfoMap() const;
+
+        // Get the allocation object (IUnknown*) from a data pointer
+        // This is ABI-safe because both sides use the same allocator instance
+        IUnknown* GetAllocationFromDataPointer(void* data_ptr) const;
+
+        void IncreasePartitionKernelPrefixVal() const
+        {
+            m_partitionKernelPrefixVal++;
+        }
+
+        uint64_t GetPartitionKernelPrefixVal() const
+        {
+            return m_partitionKernelPrefixVal;
+        }
+
+        Ort::Status OnSessionInitializationEnd();
+        std::vector<OrtAllocator*> CreatePreferredAllocators();
+
+    private:
+        void FlushUploadsIfReady() const;
+
+        void CpuToGpuCopy(IMLOperatorTensor* src, IMLOperatorTensor* dst);
+        void GpuToGpuCopy(IMLOperatorTensor* src, IMLOperatorTensor* dst);
+        void GpuToCpuCopy(IMLOperatorTensor* src, IMLOperatorTensor* dst);
+        // Resolve the ID3D12Resource for a tensor on either the DEFAULT or host-accessible allocator.
+        ID3D12Resource* ResolveTensorResource(IMLOperatorTensor* tensor);
+        bool IsGpuTensor(const onnxruntime::Tensor& tensor);
+
+        Microsoft::WRL::ComPtr<ID3D12Device> m_d3d12Device;
+        Microsoft::WRL::ComPtr<IDMLDevice> m_dmlDevice;
+        bool m_isMcdmDevice = false;
+        bool m_areCustomHeapsSupported = false;
+        bool m_areMetacommandsEnabled = true;
+        int m_currentGraphAnnotationId = 0;
+        bool m_native16BitShaderOpsSupported = false;
+        bool m_graphCaptured = false;
+        bool m_graphCaptureEnabled = false;
+
+        std::unordered_map<int, std::vector<std::unique_ptr<DmlReusedCommandListState>>> m_capturedGraphs;
+        std::unordered_set<int> m_graphCapturingDone;
+        bool m_sessionInitialized = false;
+        bool m_cpuSyncSpinningEnabled = false;
+        bool m_memoryArenaDisabled = false;
+
+        Microsoft::WRL::ComPtr<ExecutionContext> m_context;
+        OrtMemoryInfo* m_cpuMemInfo;
+        std::unique_ptr<PluginDmlPooledUploadHeap> m_uploadHeap;
+        std::unique_ptr<PluginDmlReadbackHeap> m_readbackHeap;
+        std::shared_ptr<DmlBucketizedBufferAllocator> m_allocator;
+        std::shared_ptr<CpuAllocator> m_cpuInputAllocator;
+        // Host-accessible (CPU-writable) allocator for decode inputs; null when unsupported.
+        std::shared_ptr<DmlHostAccessibleAllocator> m_hostAccessibleAllocator;
+        // Non-owning pointer to the factory-owned shared-allocator holder (see ctor). When set, the
+        // host-accessible allocator is shared across all EP instances via this holder.
+        std::shared_ptr<DmlHostAccessibleAllocator>* m_factoryHostAllocHolder = nullptr;
+        bool m_hostAccessibleSupported = false;
+        std::shared_ptr<onnxruntime::KernelRegistry> m_kernelRegistry;
+        std::shared_ptr<const InternalRegistrationInfoMap> m_internalRegInfoMap;
+        mutable uint64_t m_partitionKernelPrefixVal = 0;
+        bool m_closed = false;
+        mutable std::chrono::time_point<std::chrono::steady_clock> m_lastUploadFlushTime;
+
+        static constexpr std::chrono::milliseconds m_batchFlushInterval = std::chrono::milliseconds(10);
+        OrtMemoryInfo* m_gpuMemInfo{};
+        OrtMemoryInfo* m_hostAccessibleMemInfo{};
+    };
+
+}  // namespace dml_ep
