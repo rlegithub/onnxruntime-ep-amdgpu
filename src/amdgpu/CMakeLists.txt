@@ -45,7 +45,7 @@ endif()
 
 if(WIN32)
     set_property(TARGET amdgpu-ep APPEND_STRING
-            PROPERTY LINK_FLAGS /DEF:${PROJECT_SOURCE_DIR}/src/shared/symbols.def)
+            PROPERTY LINK_FLAGS -Wl,/DEF:${PROJECT_SOURCE_DIR}/src/shared/symbols.def)
     install(TARGETS amdgpu-ep
             DESTINATION ".")
     install(FILES $<TARGET_PDB_FILE:amdgpu-ep>
