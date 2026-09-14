@@ -7,7 +7,7 @@ target_link_libraries(hip-ep PRIVATE plugin-ep-utils)
 
 if(WIN32)
     set_property(TARGET hip-ep APPEND_STRING
-            PROPERTY LINK_FLAGS /DEF:${PROJECT_SOURCE_DIR}/src/shared/symbols.def)
+            PROPERTY LINK_FLAGS -Wl,/DEF:${PROJECT_SOURCE_DIR}/src/shared/symbols.def)
 
     install(TARGETS hip-ep
             DESTINATION ".")
