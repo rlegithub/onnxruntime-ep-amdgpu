@@ -37,7 +37,10 @@ public:
         // Factory-owned holder for the shared host-accessible allocator (nullptr = per-EP legacy).
         std::shared_ptr<DmlHostAccessibleAllocator>* factoryHostAllocHolder = nullptr,
         // Opt-in for host-accessible (CUSTOM/L0) decode inputs (ep.directml.enable_host_accessible).
-        bool enableHostAccessible = false);
+        bool enableHostAccessible = false,
+        // EPContext generation: when ORT drives a compile-and-dump pass (ep.context_enable=1),
+        // emit an EPContext node embedding the serialized DML graph (WebNN no-recompile path).
+        bool enableEpContext = false);
 
     ~ExecutionProviderPlugin();
 
@@ -265,6 +268,7 @@ private:
     bool m_sessionInitialized = false;
     bool m_cpuSyncSpinningEnabled = false;
     bool m_memoryArenaDisabled = false;
+    bool m_epContextEnable = false;  // ep.context_enable: emit EPContext nodes in CompileImpl
 
     int m_currentGraphAnnotationId = 0;
     std::unordered_set<int> m_graphCapturingDone;

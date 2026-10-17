@@ -85,12 +85,18 @@ public:
 
     // Compile a Tier-0 fused subgraph.  Returns an OrtNodeComputeInfo on
     // success, or nullptr if compilation fails (caller falls back to Tier-2/1).
+    //
+    // When out_serialized_graph != nullptr and compilation succeeds, it is filled
+    // with the SerializeDmlGraph() flatbuffer blob of the compiled DML graph, so a
+    // later session can reload it (DeserializeDmlGraph) for the EPContext path
+    // without re-translating from ONNX.
     static OrtNodeComputeInfo* Compile(
         const OrtApi&                                            ort_api,
         const OrtGraph*                                          fused_subgraph,
         const std::unordered_map<std::string, const OrtValue*>&  initializers,
         PluginDmlExecutionProviderImpl*                          provider,
-        const std::unordered_map<std::string, std::vector<int64_t>>& resolved_shapes = {});
+        const std::unordered_map<std::string, std::vector<int64_t>>& resolved_shapes = {},
+        std::string*                                            out_serialized_graph = nullptr);
 
     // Lightweight feasibility check — runs translation + CreateOperator +
     // CompileGraph against the main graph. Returns true if CompileGraph
