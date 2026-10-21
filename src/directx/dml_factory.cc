@@ -6,6 +6,7 @@
 
 #include "dml_ep.h"
 #include "dml_factory.h"
+#include "onnxruntime_env_config_keys.h"  // kOrtEnvAllowVirtualDevices (Track-2 AOT virtual device)
 
 namespace dml_ep {
 
@@ -323,6 +324,21 @@ OrtStatus* ORT_API_CALL ProviderFactory::CreateEpImpl(OrtEpFactory* this_ptr,
                 } else if (key == "ep.directml.compile_only") {
                     compile_only_opt = (value == "1" || value == "true");
                 }
+            }
+        }
+    }
+
+    // Virtual-device / compiler-process signal: the umbrella registers a virtual device when the
+    // host set env config allow_virtual_devices=1 (a ".virtual" registration name). In that process
+    // there is no GPU device, so go device-less. Read it from the env config (OR with the explicit
+    // ep.directml.compile_only option). The dispatch (GPU) process does NOT set this → normal device.
+    {
+        OrtKeyValuePairs* env_cfg = nullptr;
+        if (factory->ep_api.GetEnvConfigEntries(&env_cfg) == nullptr && env_cfg != nullptr) {
+            const Ort::KeyValuePairs kv{env_cfg};
+            for (const auto& [key, value] : kv.GetKeyValuePairs()) {
+                if (std::string_view(key) == kOrtEnvAllowVirtualDevices && std::string_view(value) == "1")
+                    compile_only_opt = true;
             }
         }
     }
