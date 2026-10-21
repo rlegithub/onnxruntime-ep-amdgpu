@@ -305,6 +305,11 @@ OrtStatus* ORT_API_CALL ProviderFactory::CreateEpImpl(OrtEpFactory* this_ptr,
     // by the umbrella) tells the DX backend to emit EPContext nodes in CompileImpl so a
     // reloaded model skips recompilation (the WebNN no-recompile path).
     bool enable_ep_context = false;
+    // ep.directml.compile_only (Track-2 AOT POC): device-less serialize-only generate for the
+    // Win32k-locked WebNN Compiler process. A session config entry (reliable across the
+    // Python/native CRT boundary, unlike an env var). TODO: replace with the ORT virtual-device
+    // path (.virtual registration + allow_virtual_devices).
+    bool compile_only_opt = false;
     {
         OrtKeyValuePairs* config_entries = nullptr;
         if (factory->ort_api.GetSessionOptionsConfigEntries(session_options, &config_entries) == nullptr
@@ -315,6 +320,8 @@ OrtStatus* ORT_API_CALL ProviderFactory::CreateEpImpl(OrtEpFactory* this_ptr,
                     enable_host_accessible = (value == "1" || value == "true");
                 } else if (key == "ep.context_enable") {
                     enable_ep_context = (value == "1" || value == "true");
+                } else if (key == "ep.directml.compile_only") {
+                    compile_only_opt = (value == "1" || value == "true");
                 }
             }
         }
@@ -326,25 +333,36 @@ OrtStatus* ORT_API_CALL ProviderFactory::CreateEpImpl(OrtEpFactory* this_ptr,
             "DirectML EP supports selection for a single or none devices");
     }
 
-    // Create DML device and execution context for the selected adapter.
-    // Share ONE ID3D12Device across all EP instances (factory->d3d12_device), created once and reused.
-    // D3D12 resources are device-local, so the factory-scoped host-accessible allocator (built below on
-    // this device) is only valid for buffers bound in an EP that uses the SAME device -> the device
-    // MUST be shared, not freshly created per EP. Command queue / DML device / ExecutionContext stay
-    // per-EP (they are cheap and the context lifetime is per-session).
-    if (!factory->d3d12_device) {
-        factory->d3d12_device = factory->CreateD3d12Device();
-    }
-    Microsoft::WRL::ComPtr<ID3D12Device> d3d12_device = factory->d3d12_device;
-    Microsoft::WRL::ComPtr<ID3D12CommandQueue> cmd_queue = factory->CreateCommandQueue(d3d12_device);
-    Microsoft::WRL::ComPtr<IDMLDevice> dml_device = factory->CreateDMLDevice(d3d12_device);
+    // compile-only / virtual device (Track-2 AOT POC): when AMDGPU_DX_COMPILE_ONLY=1 and
+    // EPContext generation is on, create the EP with NO D3D12/DML device. The Win32k-locked
+    // WebNN Compiler process cannot create a device; the EP only serializes the DML graph IR
+    // (device-bound CompileGraph is deferred to the dispatch/GPU process). TODO: replace the
+    // env gate with the ORT virtual-device path (.virtual registration + allow_virtual_devices).
+    const bool compile_only = enable_ep_context && compile_only_opt;
 
-    auto context = wil::MakeOrThrow<ExecutionContext>(
-        d3d12_device.Get(), 
-        dml_device.Get(),
-        cmd_queue.Get(),
-        false,
-        false);
+    Microsoft::WRL::ComPtr<ID3D12Device> d3d12_device;
+    Microsoft::WRL::ComPtr<IDMLDevice> dml_device;
+    Microsoft::WRL::ComPtr<ExecutionContext> context;
+    if (!compile_only) {
+        // Create DML device and execution context for the selected adapter.
+        // Share ONE ID3D12Device across all EP instances (factory->d3d12_device), created once and reused.
+        // D3D12 resources are device-local, so the factory-scoped host-accessible allocator (built below on
+        // this device) is only valid for buffers bound in an EP that uses the SAME device -> the device
+        // MUST be shared, not freshly created per EP. Command queue / DML device / ExecutionContext stay
+        // per-EP (they are cheap and the context lifetime is per-session).
+        if (!factory->d3d12_device) {
+            factory->d3d12_device = factory->CreateD3d12Device();
+        }
+        d3d12_device = factory->d3d12_device;
+        Microsoft::WRL::ComPtr<ID3D12CommandQueue> cmd_queue = factory->CreateCommandQueue(d3d12_device);
+        dml_device = factory->CreateDMLDevice(d3d12_device);
+        context = wil::MakeOrThrow<ExecutionContext>(
+            d3d12_device.Get(),
+            dml_device.Get(),
+            cmd_queue.Get(),
+            false,
+            false);
+    }
 
     factory->m_ep = std::make_unique<ExecutionProviderPlugin>(
         static_cast<const ApiPtrs&>(*factory), // use the ApiPtrs base already initialized
@@ -354,7 +372,8 @@ OrtStatus* ORT_API_CALL ProviderFactory::CreateEpImpl(OrtEpFactory* this_ptr,
         context,
         &factory->host_accessible_allocator_,  // shared across EP instances (fixes 2-session MISS)
         enable_host_accessible,                // opt-in from ep.directml.enable_host_accessible
-        enable_ep_context);                    // opt-in from ep.context_enable (EPContext generate)
+        enable_ep_context,                     // opt-in from ep.context_enable (EPContext generate)
+        compile_only);                         // opt-in from ep.directml.compile_only (device-less AOT)
 
     // keep a non-owning raw pointer to the EP for use in the data transfer implementation
     factory->m_ep_raw = factory->m_ep.get();
