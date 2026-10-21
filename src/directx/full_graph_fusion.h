@@ -96,7 +96,13 @@ public:
         const std::unordered_map<std::string, const OrtValue*>&  initializers,
         PluginDmlExecutionProviderImpl*                          provider,
         const std::unordered_map<std::string, std::vector<int64_t>>& resolved_shapes = {},
-        std::string*                                            out_serialized_graph = nullptr);
+        std::string*                                            out_serialized_graph = nullptr,
+        // compile_only (AOT / compiler-process path): build + serialize the DML graph
+        // IR but SKIP the device-bound steps (CreateOperator / CompileGraph / init /
+        // upload). Requires out_serialized_graph. Returns a stub compute-info whose
+        // Compute errors — the blob is meant for a separate dispatch session. The
+        // produced blob is identical to the normal path (same SerializeDmlGraph bytes).
+        bool                                                    compile_only = false);
 
     // EPContext reload (consume): rebuild a compute kernel directly from the serialized
     // DML graph embedded in an EPContext node, without ONNX translation. The blob is
