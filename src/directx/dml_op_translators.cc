@@ -2842,8 +2842,18 @@ static std::optional<TranslatedOp> TranslatePad(
         for (size_t d = 0; d < rank; ++d) out_sizes[d] = in_info->sizes[d] + start_pad[d] + end_pad[d];
     }
 
-    auto in_tensor  = MakeTensorInfo(in_info->sizes, in_info->data_type);
-    auto out_tensor = MakeTensorInfo(out_sizes, in_info->data_type);
+    // The padding arrays and DimensionCount above are expanded to padded_rank
+    // (>=4D). DML requires the input/output tensor ranks to match
+    // DimensionCount, so expand the tensor shapes to the same rank by
+    // prepending leading 1s. For inputs already >=4D this is a no-op
+    // (pad_count==0). Without this, a sub-4D Pad (e.g. 2D [2,3] inside a Q/DQ
+    // subgraph) builds a 4D desc over 2D tensors -> CreateOperator E_INVALIDARG.
+    std::vector<uint32_t> in_sizes_4d(pad_count, 1u), out_sizes_4d(pad_count, 1u);
+    in_sizes_4d.insert(in_sizes_4d.end(), in_info->sizes.begin(), in_info->sizes.end());
+    out_sizes_4d.insert(out_sizes_4d.end(), out_sizes.begin(), out_sizes.end());
+
+    auto in_tensor  = MakeTensorInfo(in_sizes_4d, in_info->data_type);
+    auto out_tensor = MakeTensorInfo(out_sizes_4d, in_info->data_type);
 
     struct PadStorage {
         DML_PADDING1_OPERATOR_DESC desc{};
